@@ -139,6 +139,30 @@ function deepMerge(
   return result;
 }
 
+/**
+ * bwrap creates a missing `--ro-bind` target as a read-only empty file, so every
+ * deny path the runtime lists but the project does not have (`.bashrc`, `.env`,
+ * `.idea`, …) is materialised as 0-byte litter in the working directory. Dropping
+ * the binds whose target does not exist loses nothing: there is no file to hide.
+ */
+function dropMissingDevNullBinds(command: string): string {
+  if (!command.startsWith("bwrap ")) return command;
+
+  const sep = command.search(/ -- (?!-)/);
+  const argv = sep === -1 ? command : command.slice(0, sep);
+  const rest = sep === -1 ? "" : command.slice(sep);
+
+  const filtered = argv.replace(
+    /--(?:ro-)?bind \/dev\/null ((?:\\.|[^\s])+) ?/g,
+    (match, target: string) => {
+      const path = target.replace(/\\(.)/g, "$1");
+      return existsSync(path) ? match : "";
+    },
+  );
+
+  return filtered + rest;
+}
+
 function createSandboxedBashOps(): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout }) {
@@ -146,7 +170,9 @@ function createSandboxedBashOps(): BashOperations {
         throw new Error(`Working directory does not exist: ${cwd}`);
       }
 
-      const wrappedCommand = await SandboxManager.wrapWithSandbox(command);
+      const wrappedCommand = dropMissingDevNullBinds(
+        await SandboxManager.wrapWithSandbox(command),
+      );
 
       return new Promise((resolve, reject) => {
         const child = spawn("bash", ["-c", wrappedCommand], {

@@ -159,14 +159,16 @@ That is why change (2) above exists: with no allowlist, filesystem sandboxing is
 complete and nothing that needs socat is ever built. Install socat if you want
 domain filtering.
 
-### bwrap deny-target caveat
+### bwrap deny-target handling
 
-The runtime binds `/dev/null` over a fixed set of dangerous paths (`.git`,
+The runtime binds `/dev/null` over a fixed set of dangerous paths (`.git/config`,
 `.claude/commands`, `.claude/agents`, `.vscode`, `.idea`, `.bashrc`, `.env`, …).
-bwrap creates a missing target as a read-only *file*, so on the first run in a
-directory that has no `.git/` or `.claude/`, those names become files, and every
-later run fails with `bwrap: Can't mkdir parents for .../.git/hooks: Not a
-directory`. A missing `.mcp.json` likewise becomes an empty file, which then
-breaks pi-mcp-adapter's config parse. Real checkouts have all three; a scratch
-directory needs `mkdir -p .git/hooks .claude/commands .claude/agents` and a
-valid `.mcp.json` first.
+bwrap materialises a missing target as a read-only empty *file*, so in any
+directory lacking some of those names the first run left 0-byte placeholders
+behind — and a placeholder `.git` then broke every later run with `bwrap: Can't
+mkdir parents for .../.git/hooks: Not a directory`.
+
+`dropMissingDevNullBinds()` in `index.ts` strips every `--ro-bind /dev/null
+<target>` (and `--bind` variant) whose target does not exist on the host before
+the bwrap command is executed. Nothing is lost: there is no file to hide. Any
+directory, including a bare scratch dir, is now safe to run in.
