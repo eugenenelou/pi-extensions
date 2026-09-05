@@ -70,8 +70,10 @@ type FilesystemConfig = Partial<SandboxRuntimeConfig["filesystem"]> & {
   allowRead?: string[];
 };
 
-interface SandboxConfig
-  extends Omit<SandboxRuntimeConfig, "network" | "filesystem"> {
+interface SandboxConfig extends Omit<
+  SandboxRuntimeConfig,
+  "network" | "filesystem"
+> {
   enabled?: boolean;
   network?: Partial<SandboxRuntimeConfig["network"]>;
   filesystem?: FilesystemConfig;
@@ -275,7 +277,8 @@ function denialLines(output: string): string[] {
   const seen = new Set<string>();
   for (const raw of output.split("\n")) {
     const line = raw.trim();
-    if (!line || !DENIAL_PATTERNS.some((pattern) => pattern.test(line))) continue;
+    if (!line || !DENIAL_PATTERNS.some((pattern) => pattern.test(line)))
+      continue;
     seen.add(line);
     if (seen.size >= MAX_DENIAL_LINES) break;
   }
@@ -459,6 +462,30 @@ function sandboxHint(capture: ExecCapture): string | undefined {
   return `<sandbox_hint>\n${parts.join("\n")}\n</sandbox_hint>`;
 }
 
+/**
+ * Session marker other extensions read to know whether bash is really
+ * sandboxed. It is published on `globalThis` only once the bash override is
+ * wired *and* the sandbox is in force, so a load failure of this file leaves it
+ * undefined and a reader can fail closed. Every path that deliberately runs
+ * unsandboxed publishes `active: false` with a reason instead.
+ */
+export type CodassSandboxMarker = {
+  active: boolean;
+  reason?: string;
+  config?: {
+    networkRestricted: boolean;
+    allowRead: number;
+    allowWrite: number;
+    denyWrite: number;
+    trace: boolean;
+  };
+};
+
+function publishMarker(marker: CodassSandboxMarker): void {
+  (globalThis as { __codassSandbox?: CodassSandboxMarker }).__codassSandbox =
+    marker;
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
@@ -511,6 +538,7 @@ export default function (pi: ExtensionAPI) {
 
     if (noSandbox) {
       sandboxEnabled = false;
+      publishMarker({ active: false, reason: "--no-sandbox" });
       ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
       return;
     }
@@ -519,6 +547,7 @@ export default function (pi: ExtensionAPI) {
 
     if (!config.enabled) {
       sandboxEnabled = false;
+      publishMarker({ active: false, reason: "disabled in sandbox.json" });
       ctx.ui.notify("Sandbox disabled via config", "info");
       return;
     }
@@ -526,6 +555,10 @@ export default function (pi: ExtensionAPI) {
     const platform = process.platform;
     if (platform !== "darwin" && platform !== "linux") {
       sandboxEnabled = false;
+      publishMarker({
+        active: false,
+        reason: `unsupported platform ${platform}`,
+      });
       ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
       return;
     }
@@ -533,7 +566,8 @@ export default function (pi: ExtensionAPI) {
     const networkRestricted = config.network?.allowedDomains !== undefined;
 
     filesystem = config.filesystem ?? {};
-    traceEnabled = config.trace === true || process.env.PI_SANDBOX_TRACE === "1";
+    traceEnabled =
+      config.trace === true || process.env.PI_SANDBOX_TRACE === "1";
     if (traceEnabled && !hasStrace()) {
       ctx.ui.notify(
         "Sandbox tracing requested but strace is not installed; running untraced",
@@ -542,6 +576,18 @@ export default function (pi: ExtensionAPI) {
     }
     // allowRead is this extension's own key; the runtime schema does not know it.
     const { allowRead: _allowRead, ...runtimeFilesystem } = filesystem;
+
+    const publishActive = () =>
+      publishMarker({
+        active: true,
+        config: {
+          networkRestricted,
+          allowRead: filesystem.allowRead?.length ?? 0,
+          allowWrite: filesystem.allowWrite?.length ?? 0,
+          denyWrite: filesystem.denyWrite?.length ?? 0,
+          trace: traceEnabled,
+        },
+      });
 
     try {
       const configExt = config as unknown as {
@@ -558,6 +604,7 @@ export default function (pi: ExtensionAPI) {
 
       sandboxEnabled = true;
       sandboxInitialized = true;
+      publishActive();
 
       const networkCount = config.network?.allowedDomains?.length ?? 0;
       const writeCount = config.filesystem?.allowWrite?.length ?? 0;
@@ -577,6 +624,7 @@ export default function (pi: ExtensionAPI) {
       if (!networkRestricted) {
         sandboxEnabled = true;
         sandboxInitialized = true;
+        publishActive();
         ctx.ui.setStatus(
           "sandbox",
           ctx.ui.theme.fg(
@@ -591,6 +639,10 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       sandboxEnabled = false;
+      publishMarker({
+        active: false,
+        reason: `initialization failed: ${err instanceof Error ? err.message : err}`,
+      });
       ctx.ui.notify(
         `Sandbox initialization failed: ${err instanceof Error ? err.message : err}`,
         "error",

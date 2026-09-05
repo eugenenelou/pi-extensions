@@ -252,6 +252,31 @@ A failed sandboxed command also carries a `<sandbox_hint>` block appended to its
 tool result, listing those lines and pointing at the allow list, so the model
 learns the path is outside the sandbox instead of retrying blind.
 
+### Activation marker
+
+The extension publishes a session marker on `globalThis` so another extension in
+the same process can tell whether bash is really sandboxed:
+
+```ts
+globalThis.__codassSandbox = {
+  active: true,
+  config: { networkRestricted, allowRead, allowWrite, denyWrite, trace }, // counts
+};
+```
+
+It is set from `session_start`, after the bash override is wired *and* the
+sandbox is in force — never at import time. Every path that deliberately runs
+unsandboxed publishes `{ active: false, reason }` instead: `--no-sandbox`,
+`"enabled": false`, an unsupported platform, and a `SandboxManager.initialize()`
+failure that is not the socat case. A load failure of this file leaves the
+marker undefined.
+
+The `codass-hooks.ts` extension codass generates depends on this: at each `bash`
+`tool_call` it reads the marker and blocks the call unless `active` is true, so
+a sandbox that never registered fails closed instead of falling back to pi's
+built-in unsandboxed bash. `PI_SANDBOX_OFF=1` in the environment is the explicit
+opt-out; the hooks extension notifies loudly once per session when it is used.
+
 ### `trace`
 
 `"trace": true` in the config, or `PI_SANDBOX_TRACE=1` in the environment, wraps
