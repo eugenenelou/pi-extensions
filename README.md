@@ -84,6 +84,9 @@ The child binary is resolved as pi's own entry script under the current runtime
 - chain: `{ chain: [{ agent, task }] }` — `{previous}` in a task is replaced by
   the previous step's final output; the chain stops on the first failure
 
+Each result carries the child's `model` and `thinking` in the tool `details` and
+in its usage line, so a nested dispatch can be traced to the model that ran it.
+
 Progress streams through `onUpdate`. Every returned text is capped at 50 KB;
 the untruncated messages stay in the tool details. Aborting the tool (Ctrl+C)
 sends SIGTERM to the children, then SIGKILL after 5s.

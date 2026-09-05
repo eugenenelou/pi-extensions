@@ -59,6 +59,7 @@ function formatUsageStats(
     turns?: number;
   },
   model?: string,
+  thinking?: string,
 ): string {
   const parts: string[] = [];
   if (usage.turns)
@@ -70,7 +71,7 @@ function formatUsageStats(
   if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
   if (usage.contextTokens && usage.contextTokens > 0)
     parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
-  if (model) parts.push(model);
+  if (model) parts.push(thinking ? `${model}:${thinking}` : model);
   return parts.join(" ");
 }
 
@@ -170,6 +171,7 @@ interface SingleResult {
   stderr: string;
   usage: UsageStats;
   model?: string;
+  thinking?: string;
   stopReason?: string;
   errorMessage?: string;
   step?: number;
@@ -408,6 +410,7 @@ async function runSingleAgent(
       turns: 0,
     },
     model,
+    thinking,
     step,
   };
 
@@ -1006,7 +1009,7 @@ export default function (pi: ExtensionAPI) {
           } else {
             appendResultBody(container, r);
           }
-          const usageStr = formatUsageStats(r.usage, r.model);
+          const usageStr = formatUsageStats(r.usage, r.model, r.thinking);
           if (usageStr) {
             container.addChild(new Spacer(1));
             container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
@@ -1026,7 +1029,7 @@ export default function (pi: ExtensionAPI) {
           if (displayItems.length > COLLAPSED_ITEM_COUNT)
             text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
         }
-        const usageStr = formatUsageStats(r.usage, r.model);
+        const usageStr = formatUsageStats(r.usage, r.model, r.thinking);
         if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
         return new Text(text, 0, 0);
       }
@@ -1081,7 +1084,7 @@ export default function (pi: ExtensionAPI) {
             ),
           );
           appendResultBody(container, r);
-          const taskUsage = formatUsageStats(r.usage, r.model);
+          const taskUsage = formatUsageStats(r.usage, r.model, r.thinking);
           if (taskUsage)
             container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
         }
