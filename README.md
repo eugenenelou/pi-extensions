@@ -68,7 +68,7 @@ mcpServers:                                                # optional, Claude .m
 ```
 pi --mode json -p --no-session -a \
    [--model <provider/id>] [--thinking <level>] [--tools a,b,c] \
-   [--append-system-prompt <tmpfile>] "Task: <task>"
+   [--append-system-prompt <tmpfile>] [--mcp-config <tmpfile>] "Task: <task>"
 ```
 
 `-a` is what makes nesting work: the child trusts the same project
@@ -97,59 +97,39 @@ sends SIGTERM to the children, then SIGKILL after 5s.
 
 An agent's `mcpServers` never reach `.mcp.json` and never load in the parent
 session. The parent writes `{"mcpServers": {...}}` to a 0600 temp file and
-points the child at it with:
+passes it to the child as pi-mcp-adapter's own config flag:
 
 ```
-PI_SUBAGENT_MCP_CONFIG=/tmp/pi-subagent-mcp-XXXX/mcp-<agent>.json
+--mcp-config /tmp/pi-subagent-mcp-XXXX/mcp-<agent>.json
 ```
 
-The child reads that variable at `session_start` and hands each server to the
-pi-mcp-adapter that settings `packages` already loaded:
+The flag is registered by pi-mcp-adapter, which the settings `packages` entry
+loads in the child; the adapter reads it straight off `process.argv`. Because
+the servers arrive as a config layer rather than a runtime registration, the
+child gets them with their `directTools` honoured — a `directTools: true`
+server is called as one direct tool instead of through the `mcp` proxy.
 
-```ts
-import { registerMcpServer } from "pi-mcp-adapter";
-registerMcpServer({ pi, name, definition });
-```
+The file replaces the adapter's *global* layer (`~/.pi/agent/mcp.json`) and
+merges with everything else, project layers last, so a name that also exists in
+`.mcp.json` or `.pi/mcp.json` resolves to the project's definition. Do not set
+`PI_MCP_CONFIG_MODE=exclusive`: it makes the adapter ignore the flag entirely
+and keep only the real global file. The one thing a child with inline servers
+loses is the user-global `~/.pi/agent/mcp.json` layer, which the file stands in
+for.
 
-Registrations are runtime-scoped and never persisted. `createMcpAdapter({ config })`
-— a second adapter instance — cannot be used here: it re-registers the `mcp` and
-`mcpScript` tools and the `--mcp-config` flag, and pi aborts the session with
-`Tool "mcp" conflicts with .../subagents/index.ts`. This means the child must
-have pi-mcp-adapter loaded from `packages`, which the settings above provide.
+The argv is built per spawn, so a grandchild never inherits its grandparent's
+servers: nothing is put in the environment and nothing is forwarded.
 
-`pi-mcp-adapter` is a normal `dependencies` entry of this directory, so the
-import resolves from `subagents/node_modules` — an extension cannot import the
-copy `pi install` puts in `<agent dir>/npm/node_modules`.
+A definition without a `lifecycle` is written as `lifecycle: "eager"`: a child
+is short-lived and was handed the server because it needs it, so the adapter
+connects it during startup instead of spawning it inside the first tool call.
+An explicit `lifecycle` in the agent's `mcpServers` block wins.
 
-A child that has no `mcpServers` gets the variable explicitly removed from its
-environment, so a grandchild never inherits its grandparent's servers.
-
-An inline server whose name the adapter already configures — from `.mcp.json`,
-`.pi/mcp.json`, `~/.pi/agent/mcp.json` or any other adapter source — is skipped,
-and the child logs one line to stderr (kept in the tool's `details.results[].stderr`):
-
-```
-subagents: inline MCP server "playwright" is already configured; keeping the configured one.
-```
-
-A definition without a `lifecycle` is registered as `lifecycle: "eager"`: a
-child is short-lived and was handed the server because it needs it, so the
-adapter connects it during startup instead of spawning it inside the first tool
-call. An explicit `lifecycle` in the agent's `mcpServers` block wins.
-
-`directTools` cannot be delivered this way. `registerMcpServer` in
-pi-mcp-adapter 2.32.1 rewrites every runtime registration to
-`directTools: false` — runtime servers are proxy-tool-only because direct tools
-are frozen at startup — so an inline server is always reached through the `mcp`
-proxy tool whatever its definition says. Direct tools would require handing the
-child its servers through the adapter's own `--mcp-config` flag instead of
-`PI_SUBAGENT_MCP_CONFIG`.
-
-`registerMcpServer` throws `MCP server "<name>" is already registered` on a
-duplicate name, so the check is what keeps the session clean. The configured
-definition is the one the session would keep either way; the configured name
-list comes from the adapter's own `loadMcpConfig()`, so it follows the adapter's
-source precedence.
+Direct tools are built at startup from the adapter's metadata cache
+(`~/.pi/agent/mcp-cache.json`, keyed by server name and definition hash). The
+first child to run a given server definition has no cache entry yet, so that
+run still goes through the `mcp` proxy and populates the cache; subsequent
+children get the direct tools.
 
 ## `footer/`
 

@@ -8,11 +8,10 @@
  * `.pi/settings.json` and therefore this extension: subagents can spawn
  * subagents.
  *
- * An agent that declares `mcpServers` gets them in-memory only: the parent
- * writes the resolved config to a 0600 temp file and points the child at it via
- * PI_SUBAGENT_MCP_CONFIG, which the child hands to the pi-mcp-adapter instance
- * loaded from settings `packages`. Nothing is written to `.mcp.json`, and the
- * parent session never loads those servers.
+ * An agent that declares `mcpServers` gets them for that child only: the parent
+ * writes the resolved config to a 0600 temp file and passes it as the
+ * pi-mcp-adapter's `--mcp-config <path>` flag. Nothing is written to
+ * `.mcp.json`, and the parent session never loads those servers.
  */
 
 import { spawn } from "node:child_process";
@@ -30,17 +29,13 @@ import {
   withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
-import { registerMcpServer } from "pi-mcp-adapter";
-import { loadMcpConfig } from "pi-mcp-adapter/config";
-import type { ServerEntry } from "pi-mcp-adapter/types";
 import { Type } from "typebox";
-import { type AgentConfig, discoverAgents } from "./agents.ts";
+import { type AgentConfig, type McpServers, discoverAgents } from "./agents.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
-const MCP_CONFIG_ENV = "PI_SUBAGENT_MCP_CONFIG";
 
 function formatTokens(count: number): string {
   if (count < 1000) return count.toString();
@@ -268,6 +263,20 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
   return results;
 }
 
+/**
+ * A child is short-lived and was handed these servers because it needs them:
+ * connect during startup rather than paying the spawn inside the first tool
+ * call. An explicit `lifecycle` in the agent's frontmatter wins.
+ */
+function withEagerLifecycle(servers: McpServers): McpServers {
+  return Object.fromEntries(
+    Object.entries(servers).map(([name, entry]) => [
+      name,
+      entry.lifecycle ? entry : { ...entry, lifecycle: "eager" },
+    ]),
+  );
+}
+
 async function writeTempFile(
   prefix: string,
   name: string,
@@ -437,17 +446,17 @@ async function runSingleAgent(
       args.push("--append-system-prompt", tmpPrompt.filePath);
     }
 
-    const childEnv: NodeJS.ProcessEnv = { ...process.env };
     if (agent.mcpServers) {
       tmpMcp = await writeTempFile(
         "pi-subagent-mcp-",
         `mcp-${agent.name}.json`,
-        JSON.stringify({ mcpServers: agent.mcpServers }, null, 2),
+        JSON.stringify(
+          { mcpServers: withEagerLifecycle(agent.mcpServers) },
+          null,
+          2,
+        ),
       );
-      childEnv[MCP_CONFIG_ENV] = tmpMcp.filePath;
-    } else {
-      // A nested child must not inherit its parent's inline servers.
-      delete childEnv[MCP_CONFIG_ENV];
+      args.push("--mcp-config", tmpMcp.filePath);
     }
 
     args.push(`Task: ${task}`);
@@ -457,7 +466,6 @@ async function runSingleAgent(
       const invocation = getPiInvocation(args);
       const proc = spawn(invocation.command, invocation.args, {
         cwd: cwd ?? defaultCwd,
-        env: childEnv,
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -585,76 +593,7 @@ const SubagentParams = Type.Object({
   ),
 });
 
-/** Server names the adapter already gets from its own config sources. */
-function configuredMcpServerNames(): Set<string> {
-  try {
-    return new Set(
-      Object.keys(loadMcpConfig(undefined, process.cwd()).mcpServers ?? {}),
-    );
-  } catch (err) {
-    console.error(`subagents: could not read the MCP config: ${err}`);
-    return new Set();
-  }
-}
-
-/**
- * Hand this child's inline servers to the pi-mcp-adapter already installed from
- * settings `packages`. A second adapter instance (`createMcpAdapter`) cannot be
- * used here: it would re-register `mcp`, `mcpScript` and `--mcp-config`, which
- * pi rejects as conflicts and which aborts the session. Registrations are
- * runtime-scoped and never persisted.
- *
- * An inline server whose name the adapter already configures is skipped:
- * `registerMcpServer` throws on a duplicate name, and the configured definition
- * is the one the session would keep anyway.
- */
-function registerInlineMcpServers(pi: ExtensionAPI): void {
-  const configPath = process.env[MCP_CONFIG_ENV];
-  if (!configPath) return;
-
-  let servers: Record<string, unknown>;
-  try {
-    servers = JSON.parse(fs.readFileSync(configPath, "utf-8")).mcpServers ?? {};
-  } catch (err) {
-    console.error(
-      `subagents: could not read ${MCP_CONFIG_ENV} at ${configPath}: ${err}`,
-    );
-    return;
-  }
-
-  pi.on("session_start", () => {
-    const configured = configuredMcpServerNames();
-    for (const [name, definition] of Object.entries(servers)) {
-      if (configured.has(name)) {
-        console.error(
-          `subagents: inline MCP server "${name}" is already configured; keeping the configured one.`,
-        );
-        continue;
-      }
-      const entry = definition as ServerEntry;
-      try {
-        // A child is short-lived and was handed this server because it needs
-        // it: connect during startup rather than paying the spawn inside the
-        // first tool call.
-        registerMcpServer({
-          pi,
-          name,
-          definition: entry.lifecycle
-            ? entry
-            : { ...entry, lifecycle: "eager" },
-        });
-      } catch (err) {
-        console.error(
-          `subagents: could not register MCP server "${name}": ${err}`,
-        );
-      }
-    }
-  });
-}
-
 export default function (pi: ExtensionAPI) {
-  registerInlineMcpServers(pi);
-
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
