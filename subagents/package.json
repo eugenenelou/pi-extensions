@@ -1,0 +1,14 @@
+{
+	"name": "pi-extension-subagents",
+	"private": true,
+	"version": "0.1.0",
+	"type": "module",
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"dependencies": {
+		"pi-mcp-adapter": "2.32.1"
+	}
+}
