@@ -130,6 +130,19 @@ and the child logs one line to stderr (kept in the tool's `details.results[].std
 subagents: inline MCP server "playwright" is already configured; keeping the configured one.
 ```
 
+A definition without a `lifecycle` is registered as `lifecycle: "eager"`: a
+child is short-lived and was handed the server because it needs it, so the
+adapter connects it during startup instead of spawning it inside the first tool
+call. An explicit `lifecycle` in the agent's `mcpServers` block wins.
+
+`directTools` cannot be delivered this way. `registerMcpServer` in
+pi-mcp-adapter 2.32.1 rewrites every runtime registration to
+`directTools: false` — runtime servers are proxy-tool-only because direct tools
+are frozen at startup — so an inline server is always reached through the `mcp`
+proxy tool whatever its definition says. Direct tools would require handing the
+child its servers through the adapter's own `--mcp-config` flag instead of
+`PI_SUBAGENT_MCP_CONFIG`.
+
 `registerMcpServer` throws `MCP server "<name>" is already registered` on a
 duplicate name, so the check is what keeps the session clean. The configured
 definition is the one the session would keep either way; the configured name

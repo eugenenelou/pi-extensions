@@ -588,7 +588,9 @@ const SubagentParams = Type.Object({
 /** Server names the adapter already gets from its own config sources. */
 function configuredMcpServerNames(): Set<string> {
   try {
-    return new Set(Object.keys(loadMcpConfig(undefined, process.cwd()).mcpServers ?? {}));
+    return new Set(
+      Object.keys(loadMcpConfig(undefined, process.cwd()).mcpServers ?? {}),
+    );
   } catch (err) {
     console.error(`subagents: could not read the MCP config: ${err}`);
     return new Set();
@@ -629,8 +631,18 @@ function registerInlineMcpServers(pi: ExtensionAPI): void {
         );
         continue;
       }
+      const entry = definition as ServerEntry;
       try {
-        registerMcpServer({ pi, name, definition: definition as ServerEntry });
+        // A child is short-lived and was handed this server because it needs
+        // it: connect during startup rather than paying the spawn inside the
+        // first tool call.
+        registerMcpServer({
+          pi,
+          name,
+          definition: entry.lifecycle
+            ? entry
+            : { ...entry, lifecycle: "eager" },
+        });
       } catch (err) {
         console.error(
           `subagents: could not register MCP server "${name}": ${err}`,
