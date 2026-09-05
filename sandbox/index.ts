@@ -43,9 +43,11 @@
  * the socat-based proxy bridge is never built.
  */
 
-import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
   SandboxManager,
   type SandboxRuntimeConfig,
@@ -58,9 +60,22 @@ import {
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 
-interface SandboxConfig extends Omit<SandboxRuntimeConfig, "network"> {
+type FilesystemConfig = Partial<SandboxRuntimeConfig["filesystem"]> & {
+  /**
+   * Paths kept visible inside a `denyRead` subtree. The runtime has no such
+   * key: it is applied here by reordering the bwrap argv (see
+   * `applyAllowRead`), so `denyRead: ["~/"]` can hide the whole home directory
+   * while a handful of tool directories stay readable.
+   */
+  allowRead?: string[];
+};
+
+interface SandboxConfig
+  extends Omit<SandboxRuntimeConfig, "network" | "filesystem"> {
   enabled?: boolean;
   network?: Partial<SandboxRuntimeConfig["network"]>;
+  filesystem?: FilesystemConfig;
+  trace?: boolean;
 }
 
 /**
@@ -118,6 +133,7 @@ function deepMerge(
   if (overrides.filesystem) {
     result.filesystem = { ...base.filesystem, ...overrides.filesystem };
   }
+  if (overrides.trace !== undefined) result.trace = overrides.trace;
 
   const extOverrides = overrides as {
     ignoreViolations?: Record<string, string[]>;
@@ -163,18 +179,188 @@ function dropMissingDevNullBinds(command: string): string {
   return filtered + rest;
 }
 
-function createSandboxedBashOps(): BashOperations {
+const HOME = homedir();
+
+/** Absolute path for a config entry, expanding a leading `~`. */
+function expandPath(pathPattern: string): string {
+  if (pathPattern === "~") return HOME;
+  if (pathPattern.startsWith("~/")) return join(HOME, pathPattern.slice(2));
+  return resolve(pathPattern);
+}
+
+function shellQuote(value: string): string {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value)
+    ? value
+    : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Re-expose `filesystem.allowRead` paths inside a home directory hidden by
+ * `denyRead`.
+ *
+ * bwrap applies mounts in argv order, and the runtime emits read denies last —
+ * a `--tmpfs ~` would therefore bury the worktree bind that precedes it. The
+ * tmpfs is moved to the front of the filesystem mounts, the allowRead paths are
+ * bound read-only right after it, and every write bind and deny the runtime
+ * produced keeps its place behind them.
+ */
+function applyAllowRead(command: string, filesystem: FilesystemConfig): string {
+  if (!command.startsWith("bwrap ")) return command;
+
+  const sep = command.search(/ -- (?!-)/);
+  const argv = sep === -1 ? command : command.slice(0, sep);
+  const rest = sep === -1 ? "" : command.slice(sep);
+
+  const homeTmpfs = new RegExp(
+    `--tmpfs ${escapeRegExp(shellQuote(HOME))}\\/? `,
+    "g",
+  );
+  if (!homeTmpfs.test(argv)) return command;
+
+  // Parents first: a later parent bind would shadow the child mounted before it.
+  const allowRead = [...new Set((filesystem.allowRead ?? []).map(expandPath))]
+    .filter(existsSync)
+    .sort((a, b) => a.length - b.length);
+
+  const mounts = [
+    `--tmpfs ${shellQuote(HOME)} `,
+    ...allowRead.map(
+      (path) => `--ro-bind ${shellQuote(path)} ${shellQuote(path)} `,
+    ),
+  ].join("");
+
+  const root = "--ro-bind / / ";
+  const rootAt = argv.indexOf(root);
+  if (rootAt === -1) return command;
+  const insertAt = rootAt + root.length;
+
+  const rebuilt =
+    argv.slice(0, insertAt) +
+    mounts +
+    argv.slice(insertAt).replace(homeTmpfs, "");
+
+  return rebuilt + rest;
+}
+
+const DENIAL_PATTERNS = [
+  /Read-only file system/,
+  /Permission denied/,
+  /No such file or directory/,
+  /Operation not permitted/,
+];
+const MAX_DENIAL_LINES = 10;
+const MAX_TRACE_LINES = 200;
+
+function denialLog(): string {
+  return join(getAgentDir(), "sandbox-denials.log");
+}
+
+function logDenial(entry: Record<string, unknown>): void {
+  try {
+    appendFileSync(
+      denialLog(),
+      `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`,
+    );
+  } catch {
+    // A log the agent cannot write must never fail the command.
+  }
+}
+
+/** Output lines that read like the sandbox refused a path. */
+function denialLines(output: string): string[] {
+  const seen = new Set<string>();
+  for (const raw of output.split("\n")) {
+    const line = raw.trim();
+    if (!line || !DENIAL_PATTERNS.some((pattern) => pattern.test(line))) continue;
+    seen.add(line);
+    if (seen.size >= MAX_DENIAL_LINES) break;
+  }
+  return [...seen];
+}
+
+/** Append the strace output of a finished command to the denial log. */
+function recordTrace(capture: ExecCapture, cwd: string, command: string): void {
+  const path = capture.tracePath;
+  if (!path || !existsSync(path)) return;
+  let lines: string[] = [];
+  try {
+    lines = readFileSync(path, "utf-8").split("\n").filter(Boolean);
+  } catch {
+    return;
+  }
+  if (lines.length === 0) return;
+  logDenial({
+    cwd,
+    command,
+    trace: true,
+    tracePath: path,
+    lines: lines.slice(0, MAX_TRACE_LINES),
+  });
+}
+
+let straceChecked = false;
+let straceAvailable = false;
+
+function hasStrace(): boolean {
+  if (!straceChecked) {
+    straceChecked = true;
+    straceAvailable =
+      spawnSync("which", ["strace"], { stdio: "ignore", timeout: 1000 })
+        .status === 0;
+  }
+  return straceAvailable;
+}
+
+type ExecCapture = { denials: string[]; tracePath?: string };
+
+/**
+ * Finished executions waiting for their `tool_result`. The bash tool result is
+ * assembled outside this extension — the registered tool's own `execute` is not
+ * what runs the command — so the hint is attached to the event instead.
+ */
+const pendingCaptures: { command: string; capture: ExecCapture }[] = [];
+
+function takeCapture(command: string | undefined): ExecCapture | undefined {
+  const index = pendingCaptures.findIndex((entry) => entry.command === command);
+  const [entry] = pendingCaptures.splice(index === -1 ? 0 : index, 1);
+  return entry?.capture;
+}
+
+function createSandboxedBashOps(
+  trace: boolean,
+  filesystem: FilesystemConfig,
+): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout }) {
       if (!existsSync(cwd)) {
         throw new Error(`Working directory does not exist: ${cwd}`);
       }
+      const capture: ExecCapture = { denials: [] };
 
-      const wrappedCommand = dropMissingDevNullBinds(
-        await SandboxManager.wrapWithSandbox(command),
+      let inner = command;
+      if (trace && hasStrace()) {
+        // /tmp is writable inside the jail and shared with the host, so the
+        // agent process can read the trace back after the command exits.
+        const tracePath = join(
+          tmpdir(),
+          `pi-sandbox-trace-${randomBytes(6).toString("hex")}.log`,
+        );
+        capture.tracePath = tracePath;
+        inner = `strace -f -e trace=file -e status=failed -o ${shellQuote(tracePath)} bash -c ${shellQuote(command)}`;
+      }
+
+      const wrappedCommand = applyAllowRead(
+        dropMissingDevNullBinds(await SandboxManager.wrapWithSandbox(inner)),
+        filesystem,
       );
 
       return new Promise((resolve, reject) => {
+        // Both streams: a wrapper like rtk reports the refusal on stdout.
+        let output = "";
         const child = spawn("bash", ["-c", wrappedCommand], {
           cwd,
           detached: true,
@@ -197,8 +383,12 @@ function createSandboxedBashOps(): BashOperations {
           }, timeout * 1000);
         }
 
-        child.stdout?.on("data", onData);
-        child.stderr?.on("data", onData);
+        const capturing = (data: Buffer) => {
+          if (output.length < 64 * 1024) output += data.toString();
+          onData(data);
+        };
+        child.stdout?.on("data", capturing);
+        child.stderr?.on("data", capturing);
 
         child.on("error", (err) => {
           if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -226,12 +416,47 @@ function createSandboxedBashOps(): BashOperations {
           } else if (timedOut) {
             reject(new Error(`timeout:${timeout}`));
           } else {
+            if (code !== 0) {
+              capture.denials = denialLines(output);
+              for (const line of capture.denials) {
+                logDenial({ cwd, command, line });
+              }
+            }
+            recordTrace(capture, cwd, command);
+            if (capture.denials.length > 0 || capture.tracePath) {
+              pendingCaptures.push({ command, capture });
+              if (pendingCaptures.length > 16) pendingCaptures.shift();
+            }
             resolve({ exitCode: code });
           }
         });
       });
     },
   };
+}
+
+type TextBlock = { type: "text"; text: string };
+
+/**
+ * Mirror the annotation the runtime adds to a violating command on macOS: the
+ * model is told, in the tool result itself, which lines looked like the sandbox
+ * refusing a path.
+ */
+function sandboxHint(capture: ExecCapture): string | undefined {
+  const parts: string[] = [];
+  if (capture.denials.length > 0) {
+    parts.push(
+      "The command failed on paths the sandbox may not expose:",
+      ...capture.denials.map((line) => `  ${line}`),
+      "A path outside the sandbox allow list is invisible or read-only inside it;",
+      "the allow list is filesystem.allowRead / allowWrite in .pi/sandbox.json.",
+    );
+  }
+  if (capture.tracePath) {
+    parts.push(`File-syscall trace appended to ${denialLog()}.`);
+  }
+  if (parts.length === 0) return undefined;
+  return `<sandbox_hint>\n${parts.join("\n")}\n</sandbox_hint>`;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -246,6 +471,8 @@ export default function (pi: ExtensionAPI) {
 
   let sandboxEnabled = false;
   let sandboxInitialized = false;
+  let filesystem: FilesystemConfig = {};
+  let traceEnabled = false;
 
   pi.registerTool({
     ...localBash,
@@ -256,7 +483,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const sandboxedBash = createBashTool(localCwd, {
-        operations: createSandboxedBashOps(),
+        operations: createSandboxedBashOps(traceEnabled, filesystem),
       });
       return sandboxedBash.execute(id, params, signal, onUpdate);
     },
@@ -264,7 +491,19 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("user_bash", () => {
     if (!sandboxEnabled || !sandboxInitialized) return;
-    return { operations: createSandboxedBashOps() };
+    return {
+      operations: createSandboxedBashOps(traceEnabled, filesystem),
+    };
+  });
+
+  pi.on("tool_result", (event) => {
+    if (event.toolName !== "bash") return undefined;
+    const capture = takeCapture((event.input as { command?: string }).command);
+    const hint = capture && sandboxHint(capture);
+    if (!hint) return undefined;
+    return {
+      content: [...event.content, { type: "text", text: hint } as TextBlock],
+    };
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -293,6 +532,17 @@ export default function (pi: ExtensionAPI) {
 
     const networkRestricted = config.network?.allowedDomains !== undefined;
 
+    filesystem = config.filesystem ?? {};
+    traceEnabled = config.trace === true || process.env.PI_SANDBOX_TRACE === "1";
+    if (traceEnabled && !hasStrace()) {
+      ctx.ui.notify(
+        "Sandbox tracing requested but strace is not installed; running untraced",
+        "warning",
+      );
+    }
+    // allowRead is this extension's own key; the runtime schema does not know it.
+    const { allowRead: _allowRead, ...runtimeFilesystem } = filesystem;
+
     try {
       const configExt = config as unknown as {
         ignoreViolations?: Record<string, string[]>;
@@ -301,7 +551,7 @@ export default function (pi: ExtensionAPI) {
 
       await SandboxManager.initialize({
         network: config.network,
-        filesystem: config.filesystem,
+        filesystem: runtimeFilesystem,
         ignoreViolations: configExt.ignoreViolations,
         enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
       } as Parameters<typeof SandboxManager.initialize>[0]);
@@ -376,8 +626,11 @@ export default function (pi: ExtensionAPI) {
         "",
         "Filesystem:",
         `  Deny Read: ${config.filesystem?.denyRead?.join(", ") || "(none)"}`,
+        `  Allow Read: ${config.filesystem?.allowRead?.join(", ") || "(none)"}`,
         `  Allow Write: ${config.filesystem?.allowWrite?.join(", ") || "(none)"}`,
         `  Deny Write: ${config.filesystem?.denyWrite?.join(", ") || "(none)"}`,
+        "",
+        `Trace: ${traceEnabled ? "on" : "off"}`,
       ];
       ctx.ui.notify(lines.join("\n"), "info");
     },

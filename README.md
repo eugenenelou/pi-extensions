@@ -145,7 +145,7 @@ OS-level sandboxing of the `bash` tool via `@anthropic-ai/sandbox-runtime`
 Config is merged from `~/.pi/agent/extensions/sandbox.json` then
 `<cwd>/.pi/sandbox.json` (project wins), on top of the extension defaults.
 
-Two deliberate changes to the upstream file:
+Three deliberate changes to the upstream file:
 
 1. `DEFAULT_CONFIG.network` is `{}` instead of an npm/pypi/github allowlist.
    Leaving `network.allowedDomains` undefined is the only way to get an
@@ -153,6 +153,8 @@ Two deliberate changes to the upstream file:
 2. When `SandboxManager.initialize()` fails and no domain allowlist is
    configured, the sandbox stays enabled instead of being switched off. See
    below.
+3. `filesystem.allowRead`, denied-access capture and `trace` — three additions
+   the runtime does not have. See below.
 
 ### Network and socat
 
@@ -189,3 +191,72 @@ mkdir parents for .../.git/hooks: Not a directory`.
 <target>` (and `--bind` variant) whose target does not exist on the host before
 the bwrap command is executed. Nothing is lost: there is no file to hide. Any
 directory, including a bare scratch dir, is now safe to run in.
+
+### `filesystem.allowRead`
+
+`@anthropic-ai/sandbox-runtime` 0.0.26 has no `allowRead`: on Linux it turns
+`denyRead` entries into `--tmpfs`/`--ro-bind /dev/null` mounts and offers no way
+to punch a hole back. `allowRead` is therefore an extension-only key, applied by
+rewriting the bwrap argv before the command runs.
+
+```json
+"filesystem": {
+  "allowWrite": ["/home/me/projects/atlas", "/tmp"],
+  "denyWrite": ["/home/me/projects/atlas/backend/.env"],
+  "denyRead": ["~/"],
+  "allowRead": ["~/projects", "~/.local", "~/.cache"]
+}
+```
+
+That policy is what codass generates: outside the home directory everything
+stays readable, because a build needs the system; inside it nothing is, beyond
+the listed subtrees — so the credentials of software installed later are hidden
+by default rather than after someone remembers to deny them.
+
+bwrap applies mounts in argv order, and the runtime emits read denies last, so a
+literal `--tmpfs ~` would bury the worktree bind that precedes it.
+`applyAllowRead()` moves that tmpfs to the front of the filesystem mounts, binds
+each existing `allowRead` path read-only right after it (parents before
+children), and leaves the runtime's write binds and deny binds behind them,
+where they still win.
+
+The home directory itself is a writable tmpfs inside the jail: a command can
+create `~/probe.txt`, but it lands in an empty overlay that disappears with the
+command, not in the real home.
+
+The `allowRead`/`allowWrite` lists codass writes are per-machine, from
+`.code_assistant/config.yaml`:
+
+```yaml
+pi:
+  sandbox:
+    allow_read: [...]   # replaces codass' default list
+    allow_write: [...]  # replaces codass' default list (worktree and /tmp stay)
+```
+
+### Denied-access capture
+
+The same policy file is read by the codass-generated `codass-hooks.ts`, which
+applies it to pi's `read`/`write`/`edit`/`grep`/`find`/`ls` tools — they reach
+the filesystem directly, not through the sandboxed bash.
+
+Both enforcement points append one JSON line per refusal to
+`~/.pi/agent/sandbox-denials.log`, written by the pi process, outside the jail:
+
+- sandbox: `{ts, cwd, command, line}` for each stderr line of a failed command
+  matching `Read-only file system`, `Permission denied`, `No such file or
+  directory` or `Operation not permitted` (10 lines per command at most)
+- hooks: `{ts, cwd, tool, path, reason}` for each blocked file-tool call
+
+A failed sandboxed command also carries a `<sandbox_hint>` block appended to its
+tool result, listing those lines and pointing at the allow list, so the model
+learns the path is outside the sandbox instead of retrying blind.
+
+### `trace`
+
+`"trace": true` in the config, or `PI_SANDBOX_TRACE=1` in the environment, wraps
+every sandboxed command in `strace -f -e trace=file -e status=failed`. The trace
+file is written under `/tmp` (writable and shared with the host), then appended
+to the denial log as `{ts, cwd, command, trace: true, tracePath, lines}`, capped
+at 200 lines, with a note in the tool result. Without `strace` on `PATH` the
+session notifies once and runs untraced.
