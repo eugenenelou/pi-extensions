@@ -162,9 +162,16 @@ The constant is the one visible difference: a subscription-backed provider with
 no accrued cost shows no ` (sub)` marker. `state` is a getter, so a model or
 thinking-level change is picked up on the next render.
 
-Everything inside the factory is wrapped in try/catch: a failure notifies once
-and calls `ctx.ui.setFooter(undefined)`, so a broken footer degrades to pi's
-instead of breaking the TUI. `/footer` toggles between the two for
+The built-in pads the stats line to exactly `width`, and `<used>/<window>
+<pct>%` is longer than the `<pct>%/<window>` it replaces, so every returned line
+goes through `fitToWidth`: the added columns come back out of the longest run of
+spaces (the right-alignment padding, never below one space), and truncation is
+the backstop. The TUI aborts the process on any line wider than the terminal.
+
+Everything inside the factory is wrapped in try/catch, and so is `render` itself
+— a rewrite that throws at render time returns the built-in's untouched lines.
+A construction failure notifies once and calls `ctx.ui.setFooter(undefined)`, so
+a broken footer degrades to pi's instead of breaking the TUI. `/footer` toggles between the two for
 troubleshooting. The footer is installed only in TUI mode.
 
 The line rewriting lives in `footer/render.ts`, free of any pi import, so it can

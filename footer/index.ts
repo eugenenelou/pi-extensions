@@ -12,7 +12,7 @@ import {
   type ExtensionContext,
   FooterComponent,
 } from "@earendil-works/pi-coding-agent";
-import { rewriteContextFragment } from "./render.ts";
+import { fitToWidth, rewriteContextFragment } from "./render.ts";
 
 /** The fields of pi's internal `AgentSession` that `FooterComponent` reads. */
 function footerSession(ctx: ExtensionContext) {
@@ -40,14 +40,21 @@ function applyCustomFooter(ctx: ExtensionContext): void {
         render(width: number): string[] {
           // Lines 0 and 1 are pwd and stats; anything after is the
           // extension-status line, which is what we drop.
-          const lines = builtIn.render(width).slice(0, 2);
-          if (lines.length > 1) {
-            lines[1] = rewriteContextFragment(
-              lines[1],
-              ctx.getContextUsage()?.tokens,
-            );
+          const builtInLines = builtIn.render(width).slice(0, 2);
+          try {
+            const lines = [...builtInLines];
+            if (lines.length > 1) {
+              lines[1] = rewriteContextFragment(
+                lines[1],
+                ctx.getContextUsage()?.tokens,
+              );
+            }
+            // The TUI aborts on any line wider than the terminal, and the
+            // rewrite is longer than what it replaces.
+            return lines.map((line) => fitToWidth(line, width));
+          } catch {
+            return builtInLines;
           }
-          return lines;
         },
         invalidate: () => builtIn.invalidate(),
         dispose: () => {
