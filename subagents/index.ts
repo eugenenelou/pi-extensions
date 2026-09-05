@@ -31,6 +31,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { registerMcpServer } from "pi-mcp-adapter";
+import { loadMcpConfig } from "pi-mcp-adapter/config";
 import type { ServerEntry } from "pi-mcp-adapter/types";
 import { Type } from "typebox";
 import { type AgentConfig, discoverAgents } from "./agents.ts";
@@ -584,12 +585,26 @@ const SubagentParams = Type.Object({
   ),
 });
 
+/** Server names the adapter already gets from its own config sources. */
+function configuredMcpServerNames(): Set<string> {
+  try {
+    return new Set(Object.keys(loadMcpConfig(undefined, process.cwd()).mcpServers ?? {}));
+  } catch (err) {
+    console.error(`subagents: could not read the MCP config: ${err}`);
+    return new Set();
+  }
+}
+
 /**
  * Hand this child's inline servers to the pi-mcp-adapter already installed from
  * settings `packages`. A second adapter instance (`createMcpAdapter`) cannot be
  * used here: it would re-register `mcp`, `mcpScript` and `--mcp-config`, which
  * pi rejects as conflicts and which aborts the session. Registrations are
  * runtime-scoped and never persisted.
+ *
+ * An inline server whose name the adapter already configures is skipped:
+ * `registerMcpServer` throws on a duplicate name, and the configured definition
+ * is the one the session would keep anyway.
  */
 function registerInlineMcpServers(pi: ExtensionAPI): void {
   const configPath = process.env[MCP_CONFIG_ENV];
@@ -606,7 +621,14 @@ function registerInlineMcpServers(pi: ExtensionAPI): void {
   }
 
   pi.on("session_start", () => {
+    const configured = configuredMcpServerNames();
     for (const [name, definition] of Object.entries(servers)) {
+      if (configured.has(name)) {
+        console.error(
+          `subagents: inline MCP server "${name}" is already configured; keeping the configured one.`,
+        );
+        continue;
+      }
       try {
         registerMcpServer({ pi, name, definition: definition as ServerEntry });
       } catch (err) {

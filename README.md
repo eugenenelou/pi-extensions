@@ -122,6 +122,20 @@ copy `pi install` puts in `<agent dir>/npm/node_modules`.
 A child that has no `mcpServers` gets the variable explicitly removed from its
 environment, so a grandchild never inherits its grandparent's servers.
 
+An inline server whose name the adapter already configures — from `.mcp.json`,
+`.pi/mcp.json`, `~/.pi/agent/mcp.json` or any other adapter source — is skipped,
+and the child logs one line to stderr (kept in the tool's `details.results[].stderr`):
+
+```
+subagents: inline MCP server "playwright" is already configured; keeping the configured one.
+```
+
+`registerMcpServer` throws `MCP server "<name>" is already registered` on a
+duplicate name, so the check is what keeps the session clean. The configured
+definition is the one the session would keep either way; the configured name
+list comes from the adapter's own `loadMcpConfig()`, so it follows the adapter's
+source precedence.
+
 ## `sandbox/`
 
 OS-level sandboxing of the `bash` tool via `@anthropic-ai/sandbox-runtime`
