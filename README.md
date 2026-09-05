@@ -9,13 +9,15 @@ from a generated `.pi/settings.json`:
   "packages": ["npm:pi-mcp-adapter"],
   "extensions": [
     "/home/eugene/projects/pi-extensions/subagents",
-    "/home/eugene/projects/pi-extensions/sandbox"
+    "/home/eugene/projects/pi-extensions/sandbox",
+    "/home/eugene/projects/pi-extensions/footer"
   ]
 }
 ```
 
-Both directories carry their own `package.json` + `node_modules`; run
-`npm install` in each after cloning.
+`subagents/` and `sandbox/` carry their own `package.json` + `node_modules`;
+run `npm install` in each after cloning. `footer/` has no dependencies of its
+own.
 
 ## `subagents/`
 
@@ -148,6 +150,46 @@ duplicate name, so the check is what keeps the session clean. The configured
 definition is the one the session would keep either way; the configured name
 list comes from the adapter's own `loadMcpConfig()`, so it follows the adapter's
 source precedence.
+
+## `footer/`
+
+pi's own footer, minus the extension-status line, with the context fragment
+showing how much of the window is used rather than only a percentage:
+
+```
+6.2%/272k (auto)      →   17k/272k 6.2% (auto)
+```
+
+The built-in `FooterComponent` is a public export of
+`@earendil-works/pi-coding-agent`, so the extension constructs it and
+post-processes its `render(width)` output: keep the first two lines (pwd,
+stats), rewrite the context fragment in the second. The rewrite matches the
+visible text only, so the colour wrapper pi puts around a high-usage percentage
+survives.
+
+`FooterComponent` takes pi's internal `AgentSession`, which extensions cannot
+reach. A shim exposes exactly the members it reads:
+
+| member | source |
+| --- | --- |
+| `state.model` | `ctx.model` |
+| `state.thinkingLevel` | `ctx.thinkingLevel` |
+| `sessionManager` (`getEntries`, `getCwd`, `getSessionName`) | `ctx.sessionManager` |
+| `getContextUsage()` | `ctx.getContextUsage()` |
+| `modelRuntime.isUsingSubscription(provider)` | constant `false` — no public source |
+
+The constant is the one visible difference: a subscription-backed provider with
+no accrued cost shows no ` (sub)` marker. `state` is a getter, so a model or
+thinking-level change is picked up on the next render.
+
+Everything inside the factory is wrapped in try/catch: a failure notifies once
+and calls `ctx.ui.setFooter(undefined)`, so a broken footer degrades to pi's
+instead of breaking the TUI. `/footer` toggles between the two for
+troubleshooting. The footer is installed only in TUI mode.
+
+The line rewriting lives in `footer/render.ts`, free of any pi import, so it can
+be exercised without a terminal: `node --experimental-strip-types
+footer/render.test.ts`.
 
 ## `sandbox/`
 
