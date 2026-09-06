@@ -48,7 +48,7 @@ async function activate(deployed: {
   const agentDir = join(root, "agent");
   const cwd = join(root, "project");
   mkdirSync(join(agentDir, "extensions"), { recursive: true });
-  mkdirSync(join(cwd, ".pi"), { recursive: true });
+  mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
   if (deployed.profile) {
     writeFileSync(
       join(agentDir, "extensions", "permissions.json"),
@@ -57,7 +57,7 @@ async function activate(deployed: {
   }
   if (deployed.project) {
     writeFileSync(
-      join(cwd, ".pi", "permissions.json"),
+      join(cwd, ".pi", "extensions", "permissions.json"),
       JSON.stringify({ allow: deployed.project }),
     );
   }

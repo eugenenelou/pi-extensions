@@ -174,7 +174,7 @@ export function promptFromFile(text: string): string {
 
 export interface HandoffConfig {
   /** Prompt file, absolute, `~`-prefixed, or relative to the config's own base:
-   * the agent dir for the global config, the project cwd for `.pi/handoff.json`. */
+   * the agent dir for the global config, the project cwd for the project layer. */
   promptFile?: string;
   /** Default automatic handoff for every conversation. */
   auto?: AutoConfig;

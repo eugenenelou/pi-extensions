@@ -45,25 +45,25 @@ import {
   promptFromFile,
 } from "./lib.ts";
 import { HandoffMachine, headlessHost, type Host } from "./machine.ts";
+import { configLayers } from "../shared/config.ts";
 
 const WIDGET_KEY = "handoff";
 
-function readJson(file: string): HandoffConfig {
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf-8"));
-  } catch {
-    return {};
-  }
-}
-
-/** Global `~/.pi/agent/extensions/handoff.json` under project `.pi/handoff.json`. */
+/** Global `extensions/handoff.json` under the agent dir, project under `.pi/`. */
 function loadConfig(cwd: string): HandoffConfig {
   const agentDir = getAgentDir();
-  return mergeHandoffConfig(
-    readJson(path.join(agentDir, "extensions", "handoff.json")),
-    readJson(path.join(cwd, CONFIG_DIR_NAME, "handoff.json")),
-    { agentDir, cwd, home: os.homedir() },
-  );
+  const layers = configLayers<HandoffConfig>("handoff.json", {
+    agentDir,
+    cwd,
+    configDirName: CONFIG_DIR_NAME,
+  });
+  const value = (layer: typeof layers.global): HandoffConfig =>
+    layer.doc.state === "present" ? layer.doc.value : {};
+  return mergeHandoffConfig(value(layers.global), value(layers.project), {
+    agentDir,
+    cwd,
+    home: os.homedir(),
+  });
 }
 
 /** The configured prompt file, or the built-in prompt when none is set or readable. */

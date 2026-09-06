@@ -11,9 +11,9 @@
  *
  * Config files (merged, project takes precedence):
  * - ~/.pi/agent/extensions/sandbox.json (global)
- * - <cwd>/.pi/sandbox.json (project-local)
+ * - <cwd>/.pi/extensions/sandbox.json (project-local)
  *
- * Example .pi/sandbox.json:
+ * Example .pi/extensions/sandbox.json:
  * ```json
  * {
  *   "enabled": true,
@@ -60,7 +60,6 @@ import {
   SandboxManager,
   type SandboxRuntimeConfig,
 } from "@anthropic-ai/sandbox-runtime";
-import type { Api, Model, ThinkingLevel } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -71,6 +70,16 @@ import {
   createBashTool,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
+import {
+  type ConfigBases,
+  type ConfigScope,
+  configErrors,
+  configLayers,
+  configPath,
+  configValues,
+  readConfig,
+} from "../shared/config.ts";
+import { judgeModel } from "../shared/judge.ts";
 import { capBashOutput } from "./bash-output.ts";
 import {
   JUDGE_SYSTEM_PROMPT,
@@ -121,30 +130,19 @@ const DEFAULT_CONFIG: SandboxConfig = {
   },
 };
 
+function configBases(cwd: string): ConfigBases {
+  return { agentDir: getAgentDir(), cwd, configDirName: CONFIG_DIR_NAME };
+}
+
 function loadConfig(cwd: string): SandboxConfig {
-  const projectConfigPath = join(cwd, CONFIG_DIR_NAME, "sandbox.json");
-  const globalConfigPath = join(getAgentDir(), "extensions", "sandbox.json");
-
-  let globalConfig: Partial<SandboxConfig> = {};
-  let projectConfig: Partial<SandboxConfig> = {};
-
-  if (existsSync(globalConfigPath)) {
-    try {
-      globalConfig = JSON.parse(readFileSync(globalConfigPath, "utf-8"));
-    } catch (e) {
-      console.error(`Warning: Could not parse ${globalConfigPath}: ${e}`);
-    }
+  const layers = configLayers<Partial<SandboxConfig>>(
+    "sandbox.json",
+    configBases(cwd),
+  );
+  for (const error of configErrors(layers)) {
+    console.error(`Warning: Could not parse ${error}`);
   }
-
-  if (existsSync(projectConfigPath)) {
-    try {
-      projectConfig = JSON.parse(readFileSync(projectConfigPath, "utf-8"));
-    } catch (e) {
-      console.error(`Warning: Could not parse ${projectConfigPath}: ${e}`);
-    }
-  }
-
-  return deepMerge(deepMerge(DEFAULT_CONFIG, globalConfig), projectConfig);
+  return configValues(layers).reduce<SandboxConfig>(deepMerge, DEFAULT_CONFIG);
 }
 
 function deepMerge(
@@ -485,7 +483,7 @@ function sandboxHint(capture: ExecCapture): string | undefined {
       "The command failed on paths the sandbox may not expose:",
       ...capture.denials.map((line) => `  ${line}`),
       "A path outside the sandbox allow list is invisible or read-only inside it;",
-      "the allow list is filesystem.allowRead / allowWrite in .pi/sandbox.json.",
+      "the allow list is filesystem.allowRead / allowWrite in .pi/extensions/sandbox.json.",
     );
   }
   if (capture.tracePath) {
@@ -583,61 +581,32 @@ export function sandboxPathReason(
   return `read of ${path}: hidden by the sandbox denyRead list`;
 }
 
-type RuleFile = { config: PermissionConfig } | { error: string } | undefined;
-
 /**
  * The rendered permission lists, and the rules the dialog remembered.
  *
- * codass writes the fixed lists at deploy: `<agent dir>/extensions/permissions.json`
- * for a profile, `<cwd>/.pi/permissions.json` for a project, and the two are
+ * codass writes the fixed lists at deploy: `extensions/permissions.json` under
+ * the agent dir for a profile, under `.pi/` for a project, and the two are
  * unioned. A grant made from the dialog is written beside them, in
  * `permissions.local.json`, so a redeploy never overwrites it.
  *
- * A file that is absent reads as undefined; one that is there but unparseable
- * reads as an error, which makes the machine fail closed.
+ * An unparseable file makes the machine fail closed, so it is reported rather
+ * than skipped like an absent one.
  */
-function readRuleFile(file: string): RuleFile {
-  let raw: string;
-  try {
-    raw = readFileSync(file, "utf-8");
-  } catch {
-    return undefined;
-  }
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return { error: `${file}: not a JSON object` };
-    }
-    return { config: parsed as PermissionConfig };
-  } catch (err) {
-    return {
-      error: `${file}: ${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
-}
-
 function ruleFileConfig(file: string): PermissionConfig {
-  const read = readRuleFile(file);
-  return read && "config" in read ? read.config : {};
-}
-
-function permissionFiles(cwd: string): string[] {
-  return [
-    join(getAgentDir(), "extensions", "permissions.json"),
-    join(cwd, CONFIG_DIR_NAME, "permissions.json"),
-  ];
+  const doc = readConfig<PermissionConfig>(file);
+  return doc.state === "present" ? doc.value : {};
 }
 
 function loadPermissionConfig(cwd: string): PermissionConfig {
-  const configs = permissionFiles(cwd).map(ruleFileConfig);
+  const bases = configBases(cwd);
+  const layers = configLayers<PermissionConfig>("permissions.json", bases);
+  const configs = configValues(layers);
   const errors = [
-    ...permissionFiles(cwd),
-    localRulesPath("global", cwd),
-    localRulesPath("worktree", cwd),
-  ].flatMap((file) => {
-    const read = readRuleFile(file);
-    return read && "error" in read ? [read.error] : [];
-  });
+    ...configErrors(layers),
+    ...configErrors(
+      configLayers<PermissionConfig>("permissions.local.json", bases),
+    ),
+  ];
   return {
     deny: configs.flatMap((config) => config.deny ?? []),
     allow: [...new Set(configs.flatMap((config) => config.allow ?? []))],
@@ -646,9 +615,8 @@ function loadPermissionConfig(cwd: string): PermissionConfig {
 }
 
 function localRulesPath(scope: StoredScope, cwd: string): string {
-  return scope === "global"
-    ? join(getAgentDir(), "extensions", "permissions.local.json")
-    : join(cwd, CONFIG_DIR_NAME, "permissions.local.json");
+  const layer: ConfigScope = scope === "global" ? "global" : "project";
+  return configPath("permissions.local.json", layer, configBases(cwd));
 }
 
 let announcedUnreadable: string | undefined;
@@ -660,25 +628,6 @@ function announceUnreadable(ctx: GuardCtx, message: string): void {
   const text = `permission rules unreadable, failing closed: ${message}`;
   if (ctx.hasUI) ctx.ui.notify(text, "error");
   else console.error(text);
-}
-
-/** The `judge` model role codass renders beside the extension configs. */
-function judgeModel(ctx: ExtensionContext): {
-  model: Model<Api> | undefined;
-  thinking?: ThinkingLevel;
-} {
-  const setting = ruleFileConfig(
-    join(getAgentDir(), "extensions", "judge.json"),
-  ) as unknown as {
-    provider?: string;
-    model?: string;
-    thinking?: ThinkingLevel;
-  };
-  const model =
-    setting.provider && setting.model
-      ? ctx.modelRegistry.getModel(setting.provider, setting.model)
-      : undefined;
-  return { model: model ?? ctx.model, thinking: setting.thinking };
 }
 
 /** The tool call as the model wrote it, for the judge to read. */
@@ -698,7 +647,7 @@ async function askJudge(
   call: ToolCall,
   signal: AbortSignal,
 ): Promise<Verdict> {
-  const { model, thinking } = judgeModel(ctx);
+  const { model, thinking } = judgeModel(ctx, configBases(ctx.cwd));
   if (!model) return { verdict: "ask", reason: "no judge model configured" };
   try {
     const response = await ctx.modelRegistry.completeSimple(

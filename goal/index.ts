@@ -10,11 +10,9 @@
  * successor conversation, so a goal outlives the context that started it.
  */
 
-import * as fs from "node:fs";
-import * as path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ThinkingLevel } from "@earendil-works/pi-ai";
 import {
+  CONFIG_DIR_NAME,
   convertToLlm,
   type ExtensionAPI,
   type ExtensionContext,
@@ -23,6 +21,7 @@ import {
   serializeConversation,
 } from "@earendil-works/pi-coding-agent";
 import { HANDOFF_AUTO_CHANNEL, type AutoForceRequest } from "../handoff/lib.ts";
+import { judgeModel } from "../shared/judge.ts";
 import {
   GOAL_ENTRY_TYPE,
   type GoalEntry,
@@ -60,30 +59,6 @@ function waitForIdle(ctx: ExtensionContext): Promise<boolean> {
   });
 }
 
-/** The `judge` model role codass renders beside the extension configs. */
-function judgeModel(ctx: ExtensionContext) {
-  let setting: {
-    provider?: string;
-    model?: string;
-    thinking?: ThinkingLevel;
-  } = {};
-  try {
-    setting = JSON.parse(
-      fs.readFileSync(
-        path.join(getAgentDir(), "extensions", "judge.json"),
-        "utf-8",
-      ),
-    );
-  } catch {
-    // No judge configured: the session's own model answers.
-  }
-  const model =
-    setting.provider && setting.model
-      ? ctx.modelRegistry.getModel(setting.provider, setting.model)
-      : undefined;
-  return { model: model ?? ctx.model, thinking: setting.thinking };
-}
-
 function branchMessages(branch: SessionEntry[]): AgentMessage[] {
   return branch
     .map((entry) => (entry.type === "message" ? entry.message : undefined))
@@ -95,7 +70,11 @@ async function judge(
   condition: string,
   conversation: string,
 ): Promise<Verdict | undefined> {
-  const { model, thinking } = judgeModel(ctx);
+  const { model, thinking } = judgeModel(ctx, {
+    agentDir: getAgentDir(),
+    cwd: ctx.cwd,
+    configDirName: CONFIG_DIR_NAME,
+  });
   if (!model) return undefined;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), JUDGE_TIMEOUT_MS);

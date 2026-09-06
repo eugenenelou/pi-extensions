@@ -19,7 +19,27 @@ from a generated `.pi/settings.json`:
 
 `subagents/` and `sandbox/` carry their own `package.json` + `node_modules`;
 run `npm install` in each after cloning. `footer/` has no dependencies of its
-own.
+own. `shared/` is not an extension: it holds code more than one of them uses.
+
+## Config files
+
+An extension config file lives at `extensions/<name>.json` under two roots,
+read by `shared/config.ts`:
+
+- `~/.pi/agent/extensions/<name>.json` — the agent dir, which for a codass loop
+  is the rendered profile dir
+- `<cwd>/.pi/extensions/<name>.json` — the project
+
+One relative path for both layers, so a file declared once is right for a loop
+profile and for a worktree. The helper only reads, and tells absent from
+unparseable; each extension keeps its own merge rule — `sandbox.json`
+deep-merges over the defaults, `permissions.json` unions and fails closed on an
+unparseable file, `handoff.json` resolves each layer's `promptFile` against
+that layer's own base, `judge.json` is last wins.
+
+```
+node --experimental-strip-types --test shared/config.test.ts shared/judge.test.ts
+```
 
 ## `subagents/`
 
@@ -192,8 +212,8 @@ vendored from pi-mono `examples/extensions/sandbox/`, plus the guards that cover
 what the jail does not: a deny list of dangerous commands, and the file tools,
 which reach the filesystem directly.
 
-Config is merged from `~/.pi/agent/extensions/sandbox.json` then
-`<cwd>/.pi/sandbox.json` (project wins), on top of the extension defaults.
+Config is merged from the two `extensions/sandbox.json` layers (project wins),
+on top of the extension defaults.
 
 Four deliberate changes to the upstream file:
 
@@ -444,12 +464,12 @@ settled, so the handoff then starts writing.
 The generation prompt is built in, but a skill or markdown file can replace it:
 
 ```json
-// ~/.pi/agent/extensions/handoff.json (global) or <cwd>/.pi/handoff.json (project, wins)
+// extensions/handoff.json, in the agent dir or in the project (which wins)
 { "promptFile": "docs/handoff-prompt.md" }
 ```
 
 The path is absolute, `~`-prefixed, or relative to the config's own base — the
-agent dir for the global config, the project cwd for `.pi/handoff.json` — so one
+agent dir for the global config, the project cwd for the project one — so one
 global setting follows every worktree. YAML frontmatter is dropped and the
 extension's own contract is appended (the focus note is about content, output
 the markdown only). An unreadable file warns and falls back to the built-in
@@ -519,8 +539,8 @@ node --experimental-strip-types --test loop/machine.test.ts loop/lib.test.ts
 `/goal <condition>` works towards a condition until it is reached, mirroring
 Claude Code's own `/goal`. The condition is stored in the session and starts a
 turn as the directive. After every agent run — once, however many turns the run
-took — the `judge` model (`~/.pi/agent/extensions/judge.json`, the session's
-model when none is set) reads the condition and the conversation and answers on
+took — the `judge` model (`extensions/judge.json`, the session's model when
+none is set) reads the condition and the conversation and answers on
 two lines:
 
 ```
