@@ -44,13 +44,53 @@ export function handoffPathFor(
   return path.join(sessionDir, `${sessionId}.handoff.md`);
 }
 
+const GOAL_LINE =
+  "A goal is active in this conversation: write the baton so the next conversation stays oriented on that goal.";
+
 export function buildGenerationInput(
   conversationText: string,
   focus: string,
+  goalActive = false,
 ): string {
   const parts = [`## Conversation\n\n${conversationText}`];
   if (focus) parts.push(`## Focus note\n\n${focus}`);
+  if (goalActive) parts.push(GOAL_LINE);
   return parts.join("\n\n");
+}
+
+/** Bus channel another extension emits a `HandoffRequest` on to hand off now. */
+export const HANDOFF_REQUEST_CHANNEL = "handoff:request";
+
+export interface HandoffRequest {
+  /** Goes into the baton prompt as the interactive command's focus note does. */
+  focus: string;
+  /** Where the baton is written; the path beside the transcript when absent. */
+  batonPath?: string;
+  /** Token count or percentage the caller wants automatic handoff held at. */
+  threshold?: string | number;
+  goalActive: boolean;
+}
+
+/** A bus payload as a request, or undefined when it is not one. */
+export function parseHandoffRequest(data: unknown): HandoffRequest | undefined {
+  if (typeof data !== "object" || data === null) return undefined;
+  const { focus, batonPath, threshold, goalActive } = data as Record<string, unknown>;
+  if (focus !== undefined && typeof focus !== "string") return undefined;
+  if (batonPath !== undefined && typeof batonPath !== "string") return undefined;
+  if (
+    threshold !== undefined &&
+    typeof threshold !== "string" &&
+    typeof threshold !== "number"
+  ) {
+    return undefined;
+  }
+  if (goalActive !== undefined && typeof goalActive !== "boolean") return undefined;
+  return {
+    focus: focus ?? "",
+    ...(batonPath === undefined ? {} : { batonPath }),
+    ...(threshold === undefined ? {} : { threshold }),
+    goalActive: goalActive ?? false,
+  };
 }
 
 /** The message that puts the handoff in the new session's context. No path: a

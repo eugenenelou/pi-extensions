@@ -47,20 +47,47 @@ export interface Host {
   ): Promise<{ cancelled: boolean }>;
 }
 
+/**
+ * The same machine with no terminal: widget, editor stash and notifications go
+ * nowhere, while idle detection, generation and the session switch stay live.
+ */
+export function headlessHost(host: Host, batonPath?: string): Host {
+  return {
+    ...host,
+    notify: () => {},
+    setWidget: () => {},
+    getEditorText: () => "",
+    setEditorText: () => {},
+    handoffPath: () => batonPath ?? host.handoffPath(),
+    newSession: (withSession) =>
+      host.newSession((next) =>
+        withSession({
+          appendMessage: (text) => next.appendMessage(text),
+          sendUserMessage: (text) => next.sendUserMessage(text),
+          clearWidget: () => {},
+          notify: () => {},
+        }),
+      ),
+  };
+}
+
 const CANCELLED = "Handoff cancelled; queued inputs restored to the editor";
 
 export class HandoffMachine {
   phase: Phase = "idle";
   stash: string[] = [];
   private abort: AbortController | undefined;
-  /** The host of the run in progress; set by `command`, used by `onInput`. */
+  /** The host of the run in progress; every effect of that run goes through it. */
   private host: Host | undefined;
+  /** A run started off the bus is invisible, so it must not steal typed inputs. */
+  private capturing = true;
 
   /** Extension `input` handler: true when the input was captured for the new session. */
   onInput(
     text: string,
     streamingBehavior: "steer" | "followUp" | undefined,
   ): boolean {
+    if (!this.capturing) return false;
     const capture =
       this.phase === "writing" ||
       this.phase === "switching" ||
@@ -75,18 +102,35 @@ export class HandoffMachine {
   onSessionShutdown(): void {
     if (this.phase === "switching") return;
     this.phase = "idle";
+    this.host = undefined;
     this.stash = [];
   }
 
   /** `/handoff` typed: starts a run, or cancels the one in progress. Returns at once. */
-  command(host: Host, focus: string): Promise<void> {
+  command(host: Host, focus: string, goalActive = false): Promise<void> {
     if (this.phase !== "idle") {
-      this.cancel(host, CANCELLED);
+      this.cancel(CANCELLED);
       return Promise.resolve();
     }
+    return this.start(host, focus, goalActive, true);
+  }
+
+  /** Bus entry point: starts a run, and does nothing while one is in progress. */
+  request(host: Host, focus: string, goalActive = false): Promise<void> {
+    if (this.phase !== "idle") return Promise.resolve();
+    return this.start(host, focus, goalActive, false);
+  }
+
+  private start(
+    host: Host,
+    focus: string,
+    goalActive: boolean,
+    capturing: boolean,
+  ): Promise<void> {
     this.host = host;
-    return this.run(host, focus).catch((err) => {
-      this.cancel(host, `Handoff failed: ${(err as Error).message ?? err}`);
+    this.capturing = capturing;
+    return this.run(host, focus, goalActive).catch((err) => {
+      this.cancel(`Handoff failed: ${(err as Error).message ?? err}`);
     });
   }
 
@@ -96,18 +140,28 @@ export class HandoffMachine {
   }
 
 
-  private cancel(host: Host, why: string): void {
+  /** Every effect lands on the run's own host, whoever asked for the cancel. */
+  private cancel(why: string): void {
+    const host = this.host;
     this.abort?.abort();
     this.abort = undefined;
-    this.setPhase(host, "idle");
-    if (this.stash.length > 0) {
-      host.setEditorText(restoreEditorText(this.stash, host.getEditorText()));
+    this.phase = "idle";
+    this.host = undefined;
+    if (host) {
+      host.setWidget(undefined);
+      if (this.stash.length > 0) {
+        host.setEditorText(restoreEditorText(this.stash, host.getEditorText()));
+      }
+      host.notify(why, "info");
     }
     this.stash = [];
-    host.notify(why, "info");
   }
 
-  private async run(host: Host, focus: string): Promise<void> {
+  private async run(
+    host: Host,
+    focus: string,
+    goalActive: boolean,
+  ): Promise<void> {
     this.stash = [];
     if (!host.isIdle()) {
       this.setPhase(host, "armed");
@@ -122,7 +176,7 @@ export class HandoffMachine {
 
     const conversation = host.conversation();
     if (conversation === undefined) {
-      this.cancel(host, "No conversation to hand off");
+      this.cancel("No conversation to hand off");
       return;
     }
     this.abort = new AbortController();
@@ -130,19 +184,16 @@ export class HandoffMachine {
     try {
       handoff = await host.complete(
         host.systemPrompt(),
-        buildGenerationInput(conversation, focus),
+        buildGenerationInput(conversation, focus, goalActive),
         this.abort.signal,
       );
     } catch (err) {
-      this.cancel(
-        host,
-        `Handoff generation failed: ${(err as Error).message ?? err}`,
-      );
+      this.cancel(`Handoff generation failed: ${(err as Error).message ?? err}`);
       return;
     }
     if (this.phase !== "writing") return;
     if (handoff === null) {
-      this.cancel(host, CANCELLED);
+      this.cancel(CANCELLED);
       return;
     }
     this.abort = undefined;
@@ -177,10 +228,7 @@ export class HandoffMachine {
       });
     });
     if (result.cancelled) {
-      this.cancel(
-        host,
-        "New session cancelled; queued inputs restored to the editor",
-      );
+      this.cancel("New session cancelled; queued inputs restored to the editor");
     }
   }
 }

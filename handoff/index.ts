@@ -25,13 +25,16 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import {
+  HANDOFF_REQUEST_CHANNEL,
   HANDOFF_SYSTEM_PROMPT,
   type HandoffConfig,
+  type HandoffRequest,
   handoffPathFor,
+  parseHandoffRequest,
   promptFromFile,
   resolvePromptFile,
 } from "./lib.ts";
-import { HandoffMachine, type Host } from "./machine.ts";
+import { HandoffMachine, headlessHost, type Host } from "./machine.ts";
 
 const WIDGET_KEY = "handoff";
 
@@ -187,6 +190,17 @@ function hostFor(ctx: ExtensionCommandContext): Host {
 
 export default function (pi: ExtensionAPI) {
   const machine = new HandoffMachine();
+  /** Set by a bus request, consumed by the command run it dispatches. */
+  let requested: HandoffRequest | undefined;
+
+  pi.events.on(HANDOFF_REQUEST_CHANNEL, (data) => {
+    const request = parseHandoffRequest(data);
+    if (!request) return;
+    requested = request;
+    // The bus hands out no command context, and the machine needs one for the
+    // session switch. Dispatching the command gets one without starting a turn.
+    pi.sendUserMessage("/handoff", { expandPromptTemplates: true });
+  });
 
   pi.on("input", async (event) => {
     return machine.onInput(event.text, event.streamingBehavior)
@@ -200,7 +214,9 @@ export default function (pi: ExtensionAPI) {
     description:
       "Write a handoff file and continue in a new session [focus note]",
     handler: async (args, ctx) => {
-      if (ctx.mode !== "tui") {
+      const request = requested;
+      requested = undefined;
+      if (!request && ctx.mode !== "tui") {
         ctx.ui.notify("handoff requires interactive mode", "error");
         return;
       }
@@ -208,9 +224,16 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("No model selected", "error");
         return;
       }
+      const host = hostFor(ctx);
       // Not awaited: pi's input loop waits for this handler, and inputs typed
       // while it runs would be held back from the input event.
-      void machine.command(hostFor(ctx), args.trim());
+      void (request
+        ? machine.request(
+            headlessHost(host, request.batonPath),
+            request.focus,
+            request.goalActive,
+          )
+        : machine.command(host, args.trim()));
     },
   });
 }

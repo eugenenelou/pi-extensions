@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   buildAttachment,
+  buildGenerationInput,
   handoffPathFor,
+  parseHandoffRequest,
   promptFromFile,
   resolvePromptFile,
   restoreEditorText,
@@ -50,4 +52,21 @@ test("promptFile resolves ~ and relative paths", () => {
   assert.equal(resolvePromptFile("~/a.md", "/cwd", "/home/u"), "/home/u/a.md");
   assert.equal(resolvePromptFile("x/a.md", "/cwd", "/home/u"), "/cwd/x/a.md");
   assert.equal(resolvePromptFile("/abs.md", "/cwd", "/home/u"), "/abs.md");
+});
+
+test("generation input carries the focus note and, when a goal is active, the goal line", () => {
+  const plain = buildGenerationInput("user: hi", "cover the migration");
+  assert.match(plain, /## Focus note\n\ncover the migration/);
+  assert.doesNotMatch(plain, /goal/i);
+  assert.match(buildGenerationInput("user: hi", "reach green", true), /goal/i);
+});
+
+test("a handoff request off the bus keeps only the fields it understands", () => {
+  assert.deepEqual(
+    parseHandoffRequest({ focus: "reach green", batonPath: "/c/baton.md", threshold: "80%", goalActive: true, replyTo: "loop" }),
+    { focus: "reach green", batonPath: "/c/baton.md", threshold: "80%", goalActive: true },
+  );
+  assert.deepEqual(parseHandoffRequest({}), { focus: "", goalActive: false });
+  assert.equal(parseHandoffRequest("nope"), undefined);
+  assert.equal(parseHandoffRequest({ focus: 3 }), undefined);
 });
