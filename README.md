@@ -465,3 +465,50 @@ node --experimental-strip-types --test handoff/machine.test.ts handoff/lib.test.
 
 One invariant the tests pin: the switch to the new session fires
 `session_shutdown` on the old one, and the captured inputs must survive it.
+
+## `loop/`
+
+Makes a pi session run a codass supervised loop by itself. Inert unless codass
+spawned the session with the loop env — no command, no handler, no timer:
+
+```
+CODASS_LOOP    the loop's name
+LOOP_SKILL     the tick skill, sent as /<skill>
+HANDOFF_PATH   the baton file; the loop's codass cache dir is its parent
+LOOP_CADENCE   an interval, 30s / 1m / 1h        (one of the two)
+LOOP_SCHEDULE  a 5-field cron expression, local time
+HANDOFF_AT     context tokens at which the generation hands over
+MAX_ITERS      ticks after which the generation hands over
+```
+
+The session owns its clock: codass never injects a tick and never kills it to
+cut over, it only restarts a dead process. Every five seconds the extension
+compares the `.last-tick` stamp beside the baton against the cadence (measured
+start to start) or the next cron window, and when a tick is due and the agent is
+idle it sends `/<skill>` as a user message and stamps. Deleting the stamp is
+still `tick-now`: an absent stamp reads as due at once. A cron loop with no
+stamp anchors to its next window instead, so a Monday loop pinned on Wednesday
+first runs on Monday.
+
+Each agent run — one tick, however many tool rounds it takes — bumps
+`.iter-<session id>`, the same per-generation counter codass's monitor reads and
+counts the same way. Once the count reaches `MAX_ITERS` or context reaches
+`HANDOFF_AT`, the extension asks the handoff extension — once — to hand off now
+on `handoff:request`, with a focus note about the loop and `HANDOFF_PATH` as the
+baton path. The successor conversation opens in the same process with the baton
+first, gets its own machine, and counts against its own counter file while
+ticking on the same clock. It also archives the baton it succeeded, as codass's
+own baton consumer does, and drops its predecessor's counter file. A handoff run
+that never reaches a successor — it failed, or was cancelled — is released after
+two minutes: nothing outside this session would ever unstick it, so the loop
+resumes ticking and asks again. The cutover decision stays here rather than in the
+handoff extension's auto mode, because a threshold held there is not carried
+into the successor, while the loop env is.
+
+`loop/machine.ts` is the machine over a `LoopHost` interface with no pi imports;
+`index.ts` builds the host from the extension context and owns the timer, which
+starts in `session_start` and stops in `session_shutdown`. Nothing assumes a TUI.
+
+```
+node --experimental-strip-types --test loop/machine.test.ts loop/lib.test.ts
+```
