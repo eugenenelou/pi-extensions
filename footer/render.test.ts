@@ -5,6 +5,7 @@
 
 import assert from "node:assert/strict";
 import {
+  backgroundLine,
   fitToWidth,
   rewriteContextFragment,
   visibleWidth,
@@ -61,5 +62,26 @@ assert.equal(
   visibleWidth(fitToWidth(rewriteContextFragment(TIGHT, 16000), NARROW)),
   NARROW,
 );
+
+// Nothing running: no background line at all.
+assert.equal(backgroundLine([], 80), undefined);
+
+// Running tasks are listed by id and command.
+const TASKS = [
+  { id: "bg1", command: "just test backend" },
+  { id: "bg2", command: "pnpm build" },
+];
+assert.equal(
+  backgroundLine(TASKS, 80),
+  "2 background: bg1 just test backend | bg2 pnpm build",
+);
+assert.equal(
+  backgroundLine(TASKS.slice(0, 1), 80),
+  "1 background: bg1 just test backend",
+);
+
+// A long list never overflows the terminal.
+const NARROW_LINE = backgroundLine(TASKS, 30) as string;
+assert.equal(visibleWidth(NARROW_LINE), 30);
 
 console.log("footer render rewrite: ok");

@@ -11,6 +11,7 @@ from a generated `.pi/settings.json`:
     "/home/eugene/projects/pi-extensions/subagents",
     "/home/eugene/projects/pi-extensions/sandbox",
     "/home/eugene/projects/pi-extensions/footer",
+    "/home/eugene/projects/pi-extensions/background",
     "/home/eugene/projects/pi-extensions/handoff"
   ]
 }
@@ -352,6 +353,39 @@ file is written under `/tmp` (writable and shared with the host), then appended
 to the denial log as `{ts, cwd, command, trace: true, tracePath, lines}`, capped
 at 200 lines, with a note in the tool result. Without `strace` on `PATH` the
 session notifies once and runs untraced.
+
+## `background/`
+
+Three tools to run a shell command detached from the turn. `background_run`
+starts it and returns at once with a task id and the path of the log its output
+is appended to; `background_wait` returns when the command ends or when a given
+marker appears in that log; `background_kill` stops it. There is no log pager —
+the agent reads or greps the log file itself with its own tools.
+
+A task that ends on its own sends a user message with its outcome and log path,
+which starts a turn when the agent is idle; while it is busy the outcomes queue
+and one message covers them all at `agent_settled`. A task the agent already
+heard about — through `background_wait` or `background_kill` — wakes nobody.
+Tasks belong to the session: `session_shutdown` kills whatever still runs, and
+each command is spawned detached in its own process group so a kill reaches the
+whole command tree. `/background` lists what runs.
+
+A background command is confined exactly as the bash tool is: the wrap comes
+from `globalThis.__codassSandboxWrap`, published by `sandbox/` beside its
+activation marker, and is looked up per run — extensions load in an arbitrary
+order, so `sandbox/` may publish after this one starts. No marker, an inactive
+one, or no wrap and `background_run` refuses with the reason — it never falls
+back to running unconfined.
+
+The lifecycle lives in `background/machine.ts`, free of any pi or node-process
+import, with everything that touches the outside world behind a host interface
+(`background/host.ts`). Probes: `node --experimental-strip-types
+background/machine.test.ts`, `background/sandbox.test.ts`,
+`background/wrap.test.ts` (the last one spawns real processes), and
+`sandbox/background-wrap.test.ts`, which runs a background command through the
+real bwrap jail and expects a denied write to fail. That last one lives in
+`sandbox/` for its `node_modules`, and skips unless bwrap is installed and the
+pi package is resolvable from there.
 
 ## `handoff/`
 

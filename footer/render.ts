@@ -92,3 +92,20 @@ export function fitToWidth(line: string, width: number): string {
   }
   return truncateToWidth(fitted, width);
 }
+
+/**
+ * The running-background-tasks line, or nothing when none run.
+ *
+ * The task list comes from the background extension through `globalThis`; only
+ * the id and the command are shown, since the log path is the agent's business.
+ */
+export function backgroundLine(
+  tasks: readonly { id: string; command: string }[],
+  width: number,
+): string | undefined {
+  if (tasks.length === 0) return undefined;
+  const listed = tasks
+    .map((task) => `${task.id} ${task.command}`)
+    .join(" | ");
+  return truncateToWidth(`${tasks.length} background: ${listed}`, width);
+}

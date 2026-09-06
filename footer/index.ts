@@ -12,7 +12,21 @@ import {
   type ExtensionContext,
   FooterComponent,
 } from "@earendil-works/pi-coding-agent";
-import { fitToWidth, rewriteContextFragment } from "./render.ts";
+import { backgroundLine, fitToWidth, rewriteContextFragment } from "./render.ts";
+
+/** The running tasks the background extension publishes, if it is loaded. */
+function backgroundTasks(): { id: string; command: string }[] {
+  const list = (
+    globalThis as {
+      __codassBackgroundTasks?: () => { id: string; command: string }[];
+    }
+  ).__codassBackgroundTasks;
+  try {
+    return list?.() ?? [];
+  } catch {
+    return [];
+  }
+}
 
 /** The fields of pi's internal `AgentSession` that `FooterComponent` reads. */
 function footerSession(ctx: ExtensionContext) {
@@ -49,6 +63,8 @@ function applyCustomFooter(ctx: ExtensionContext): void {
                 ctx.getContextUsage()?.tokens,
               );
             }
+            const background = backgroundLine(backgroundTasks(), width);
+            if (background) lines.push(background);
             // The TUI aborts on any line wider than the terminal, and the
             // rewrite is longer than what it replaces.
             return lines.map((line) => fitToWidth(line, width));

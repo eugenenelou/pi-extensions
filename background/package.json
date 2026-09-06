@@ -1,0 +1,11 @@
+{
+  "name": "pi-extension-background",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
