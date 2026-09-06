@@ -12,7 +12,12 @@ import {
   type ExtensionContext,
   FooterComponent,
 } from "@earendil-works/pi-coding-agent";
-import { backgroundLine, fitToWidth, rewriteContextFragment } from "./render.ts";
+import {
+  autoHandoffMarker,
+  backgroundLine,
+  fitToWidth,
+  rewriteContextFragment,
+} from "./render.ts";
 
 /** The running tasks the background extension publishes, if it is loaded. */
 function backgroundTasks(): { id: string; command: string }[] {
@@ -25,6 +30,17 @@ function backgroundTasks(): { id: string; command: string }[] {
     return list?.() ?? [];
   } catch {
     return [];
+  }
+}
+
+/** The automatic-handoff indicator the handoff extension publishes, if on. */
+function autoHandoff(): string | undefined {
+  const indicator = (globalThis as { __codassHandoffAuto?: () => string | undefined })
+    .__codassHandoffAuto;
+  try {
+    return indicator?.();
+  } catch {
+    return undefined;
   }
 }
 
@@ -58,9 +74,9 @@ function applyCustomFooter(ctx: ExtensionContext): void {
           try {
             const lines = [...builtInLines];
             if (lines.length > 1) {
-              lines[1] = rewriteContextFragment(
-                lines[1],
-                ctx.getContextUsage()?.tokens,
+              lines[1] = autoHandoffMarker(
+                rewriteContextFragment(lines[1], ctx.getContextUsage()?.tokens),
+                autoHandoff(),
               );
             }
             const background = backgroundLine(backgroundTasks(), width);

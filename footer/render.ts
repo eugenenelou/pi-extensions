@@ -109,3 +109,20 @@ export function backgroundLine(
     .join(" | ");
   return truncateToWidth(`${tasks.length} background: ${listed}`, width);
 }
+
+/** The context fragment, before the rewrite (`6.2%/272k`) or after it. */
+const CONTEXT_FRAGMENT =
+  /\d+(?:\.\d+)?[kM]?%?\/\d+(?:\.\d+)?[kM]?(?: \d+(?:\.\d+)?%)?/;
+
+/**
+ * Place the automatic-handoff indicator right after the context fragment.
+ *
+ * `undefined` while auto is off, so the fragment is left exactly as it was.
+ */
+export function autoHandoffMarker(
+  line: string,
+  indicator: string | undefined,
+): string {
+  if (!indicator) return line;
+  return line.replace(CONTEXT_FRAGMENT, (fragment) => `${fragment} ${indicator}`);
+}

@@ -25,11 +25,20 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import {
+  AUTO_ENTRY_TYPE,
+  AutoHandoff,
+  type AutoSetting,
+  parseAutoCommand,
+  settingFromEntries,
+} from "./auto.ts";
+import {
+  HANDOFF_AUTO_CHANNEL,
   HANDOFF_REQUEST_CHANNEL,
   HANDOFF_SYSTEM_PROMPT,
   type HandoffConfig,
   type HandoffRequest,
   handoffPathFor,
+  parseAutoForce,
   parseHandoffRequest,
   promptFromFile,
   resolvePromptFile,
@@ -120,7 +129,10 @@ function setWidget(ctx: ExtensionContext, lines: string[] | undefined): void {
   });
 }
 
-function hostFor(ctx: ExtensionCommandContext): Host {
+function hostFor(
+  ctx: ExtensionCommandContext,
+  setting: AutoSetting | undefined,
+): Host {
   return {
     isIdle: () => ctx.isIdle(),
     waitForIdle: () => ctx.waitForIdle(),
@@ -169,6 +181,11 @@ function hostFor(ctx: ExtensionCommandContext): Host {
     newSession: (withSession) =>
       ctx.newSession({
         parentSession: ctx.sessionManager.getSessionFile(),
+        // The successor is a fresh session file: the conversation's auto
+        // setting only carries over if it is written into it.
+        setup: async (sessionManager) => {
+          if (setting) sessionManager.appendCustomEntry(AUTO_ENTRY_TYPE, setting);
+        },
         withSession: async (next) => {
           await withSession({
             // Idle session, no trigger: appended at once, so the handoff is
@@ -190,16 +207,44 @@ function hostFor(ctx: ExtensionCommandContext): Host {
 
 export default function (pi: ExtensionAPI) {
   const machine = new HandoffMachine();
+  let auto = new AutoHandoff();
   /** Set by a bus request, consumed by the command run it dispatches. */
   let requested: HandoffRequest | undefined;
+
+  /** The bus hands out no command context, and the machine needs one for the
+   * session switch. Dispatching the command gets one without starting a turn. */
+  function run(request: HandoffRequest): void {
+    if (requested || machine.phase !== "idle") return;
+    requested = request;
+    pi.sendUserMessage("/handoff", { expandPromptTemplates: true });
+  }
 
   pi.events.on(HANDOFF_REQUEST_CHANNEL, (data) => {
     const request = parseHandoffRequest(data);
     if (!request) return;
-    requested = request;
-    // The bus hands out no command context, and the machine needs one for the
-    // session switch. Dispatching the command gets one without starting a turn.
-    pi.sendUserMessage("/handoff", { expandPromptTemplates: true });
+    if (request.threshold !== undefined) auto.force(request.threshold);
+    run(request);
+  });
+
+  pi.events.on(HANDOFF_AUTO_CHANNEL, (data) => {
+    const hold = parseAutoForce(data);
+    if (!hold) return;
+    if (hold.force) auto.force(hold.at);
+    else auto.release();
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    auto = new AutoHandoff(loadConfig(ctx.cwd).auto);
+    const setting = settingFromEntries(ctx.sessionManager.getBranch());
+    if (setting) auto.restore(setting);
+    // The footer reads the indicator from here; it cannot import this module.
+    (globalThis as { __codassHandoffAuto?: () => string | undefined })
+      .__codassHandoffAuto = () => auto.indicator();
+  });
+
+  pi.on("turn_end", async (_event, ctx) => {
+    if (!auto.shouldHandoff(ctx.getContextUsage())) return;
+    run({ focus: "", goalActive: false });
   });
 
   pi.on("input", async (event) => {
@@ -216,6 +261,24 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const request = requested;
       requested = undefined;
+      const command = request ? undefined : parseAutoCommand(args);
+      if (command) {
+        if (command.kind === "invalid") {
+          ctx.ui.notify(
+            `handoff auto: ${command.at} is neither a token count nor a percentage`,
+            "error",
+          );
+          return;
+        }
+        const setting = auto.apply(command);
+        if (setting) pi.appendEntry(AUTO_ENTRY_TYPE, setting);
+        const indicator = auto.indicator();
+        ctx.ui.notify(
+          indicator ? `Automatic handoff: ${indicator}` : "Automatic handoff off",
+          "info",
+        );
+        return;
+      }
       if (!request && ctx.mode !== "tui") {
         ctx.ui.notify("handoff requires interactive mode", "error");
         return;
@@ -224,7 +287,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("No model selected", "error");
         return;
       }
-      const host = hostFor(ctx);
+      const host = hostFor(ctx, auto.setting());
       // Not awaited: pi's input loop waits for this handler, and inputs typed
       // while it runs would be held back from the input event.
       void (request

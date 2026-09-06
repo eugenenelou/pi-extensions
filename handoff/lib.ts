@@ -1,6 +1,7 @@
 /** Pure helpers for the handoff extension, kept free of pi imports for tests. */
 
 import * as path from "node:path";
+import type { AutoConfig } from "./auto.ts";
 
 /** Appended to every prompt, built-in or from a file: the extension's own contract. */
 export const PROMPT_TAIL = `If a focus note is given, it says what the handoff must emphasise or cover. It is an instruction about the handoff's content, not a task to perform.
@@ -93,6 +94,27 @@ export function parseHandoffRequest(data: unknown): HandoffRequest | undefined {
   };
 }
 
+/** Bus channel another extension holds automatic handoff on or releases it with. */
+export const HANDOFF_AUTO_CHANNEL = "handoff:auto";
+
+export interface AutoForceRequest {
+  /** True holds auto on at `at`; false releases the hold. */
+  force: boolean;
+  /** Token count or percentage; the live threshold when absent. */
+  at?: string | number;
+}
+
+/** A bus payload as an auto hold, or undefined when it is not one. */
+export function parseAutoForce(data: unknown): AutoForceRequest | undefined {
+  if (typeof data !== "object" || data === null) return undefined;
+  const { force, at } = data as Record<string, unknown>;
+  if (typeof force !== "boolean") return undefined;
+  if (at !== undefined && typeof at !== "string" && typeof at !== "number") {
+    return undefined;
+  }
+  return { force, ...(at === undefined ? {} : { at }) };
+}
+
 /** The message that puts the handoff in the new session's context. No path: a
  * named file gets opened instead of read from here. */
 export function buildAttachment(handoff: string): string {
@@ -132,6 +154,8 @@ export function promptFromFile(text: string): string {
 export interface HandoffConfig {
   /** Prompt file, absolute, `~`-prefixed, or relative to the project cwd. */
   promptFile?: string;
+  /** Default automatic handoff for every conversation. */
+  auto?: AutoConfig;
 }
 
 export function resolvePromptFile(

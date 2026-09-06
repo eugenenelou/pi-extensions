@@ -4,6 +4,7 @@ import {
   buildAttachment,
   buildGenerationInput,
   handoffPathFor,
+  parseAutoForce,
   parseHandoffRequest,
   promptFromFile,
   resolvePromptFile,
@@ -69,4 +70,12 @@ test("a handoff request off the bus keeps only the fields it understands", () =>
   assert.deepEqual(parseHandoffRequest({}), { focus: "", goalActive: false });
   assert.equal(parseHandoffRequest("nope"), undefined);
   assert.equal(parseHandoffRequest({ focus: 3 }), undefined);
+});
+
+test("an auto hold off the bus keeps only the fields it understands", () => {
+  assert.deepEqual(parseAutoForce({ force: true, at: "40%" }), { force: true, at: "40%" });
+  assert.deepEqual(parseAutoForce({ force: false }), { force: false });
+  assert.equal(parseAutoForce({ at: "40%" }), undefined);
+  assert.equal(parseAutoForce({ force: true, at: {} }), undefined);
+  assert.equal(parseAutoForce(null), undefined);
 });
