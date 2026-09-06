@@ -495,9 +495,6 @@ function sandboxHint(capture: ExecCapture): string | undefined {
   return `<sandbox_hint>\n${parts.join("\n")}\n</sandbox_hint>`;
 }
 
-// The sandbox covers bash only; these tools reach the filesystem directly.
-const PATH_TOOLS = new Set(["read", "write", "edit", "grep", "find", "ls"]);
-
 const SANDBOX_BLOCK =
   "sandbox is not active; refusing bash (set PI_SANDBOX_OFF=1 to run unsandboxed on purpose)";
 
@@ -554,7 +551,7 @@ function isUnder(path: string, parent: string): boolean {
 }
 
 /** The rules the jail applies to bash, applied to a file-tool path. */
-function sandboxPathReason(
+export function sandboxPathReason(
   tool: string,
   rawPath: unknown,
   cwd: string,
@@ -898,7 +895,7 @@ export default function (pi: ExtensionAPI) {
         });
         return { block: true, reason: gateReason };
       }
-    } else if (PATH_TOOLS.has(event.toolName)) {
+    } else {
       // Only writes to an env file are guarded; reading one is allowed.
       if (event.toolName === "write" || event.toolName === "edit") {
         reason = envPathReason(input.path);
