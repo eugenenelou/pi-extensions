@@ -10,7 +10,8 @@ from a generated `.pi/settings.json`:
   "extensions": [
     "/home/eugene/projects/pi-extensions/subagents",
     "/home/eugene/projects/pi-extensions/sandbox",
-    "/home/eugene/projects/pi-extensions/footer"
+    "/home/eugene/projects/pi-extensions/footer",
+    "/home/eugene/projects/pi-extensions/handoff"
   ]
 }
 ```
@@ -351,3 +352,66 @@ file is written under `/tmp` (writable and shared with the host), then appended
 to the denial log as `{ts, cwd, command, trace: true, tracePath, lines}`, capped
 at 200 lines, with a note in the tool result. Without `strace` on `PATH` the
 session notifies once and runs untraced.
+
+## `handoff/`
+
+`/handoff [focus note]` replaces compaction with a handoff: the current model
+writes a forward-looking baton (goal, state, decisions, next, pointers; never a
+narration of the conversation) from the current branch, the file is saved
+beside the transcript, and a new session opens with it in context:
+
+```
+~/.pi/agent/sessions/<cwd>/<stamp>_<id>.jsonl          the session
+~/.pi/agent/sessions/<cwd>/<stamp>_<id>.handoff.md     its handoff
+```
+
+The new session is linked to the old one through `parentSession`, so `/tree`
+and `/resume` still reach the full transcript. The handoff is appended to the
+new session as its first entry, a displayed custom message, so everything that
+follows runs against it. The focus note steers what the handoff covers; it
+is not a task for the new session.
+
+The command returns at once and does its work in the background: pi's input
+loop waits for a command handler, and inputs typed meanwhile would be held
+back from extensions. A status line above the editor shows progress. Inputs typed while the
+handoff is being written are captured for the new session, listed as
+`Handoff → …`, and after the switch sent there in order, one turn each, with
+slash-command expansion: `/handoff`, then `/skill:implement PIS-1`, runs
+`implement` in the new conversation.
+
+Typed while the agent is running, `/handoff` arms instead of interrupting: it
+waits for the agent to settle, which includes follow-ups queued before the
+command, so those still run in the old session. While armed only Alt+Enter
+follow-ups are captured; Enter (steering) still goes to the running agent.
+
+`/handoff` again, armed or writing, cancels: the generation is aborted and the
+captured inputs go back into the editor ahead of any text already there. Esc
+while armed does what it always does, aborts the agent, which counts as
+settled, so the handoff then starts writing.
+
+### Prompt file
+
+The generation prompt is built in, but a skill or markdown file can replace it:
+
+```json
+// ~/.pi/agent/extensions/handoff.json (global) or <cwd>/.pi/handoff.json (project, wins)
+{ "promptFile": ".code_assistant/skills/eugene/loop-handoff/SKILL.md" }
+```
+
+The path is absolute, `~`-prefixed, or relative to the project cwd, so one
+global setting follows every worktree. YAML frontmatter is dropped and the
+extension's own contract is appended (the focus note is about content, output
+the markdown only). An unreadable file warns and falls back to the built-in
+prompt. `/skill:handoff` is a different thing: the vendored mattpocock skill,
+run by the agent itself.
+
+The behaviour is `handoff/machine.ts`, a state machine over a `Host`
+interface with no pi imports; `index.ts` builds the host from the extension
+context. Both it and the pure helpers in `lib.ts` are tested with fakes:
+
+```
+node --experimental-strip-types --test handoff/machine.test.ts handoff/lib.test.ts
+```
+
+One invariant the tests pin: the switch to the new session fires
+`session_shutdown` on the old one, and the captured inputs must survive it.
