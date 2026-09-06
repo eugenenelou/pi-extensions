@@ -68,6 +68,7 @@ import {
   createBashTool,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
+import { capBashOutput } from "./bash-output.ts";
 
 type FilesystemConfig = Partial<SandboxRuntimeConfig["filesystem"]> & {
   /**
@@ -722,9 +723,25 @@ export default function (pi: ExtensionAPI) {
     if (event.toolName !== "bash") return undefined;
     const capture = takeCapture((event.input as { command?: string }).command);
     const hint = capture && sandboxHint(capture);
-    if (!hint) return undefined;
+    const details = event.details as
+      | { truncation?: { totalLines?: number }; fullOutputPath?: string }
+      | undefined;
+    let capped = false;
+    const content = event.content.map((block) => {
+      if (block.type !== "text") return block;
+      const text = capBashOutput(block.text, {
+        fullOutputPath: details?.fullOutputPath,
+        totalLines: details?.truncation?.totalLines,
+      });
+      if (text === undefined) return block;
+      capped = true;
+      return { ...block, text } as TextBlock;
+    });
+    if (!hint && !capped) return undefined;
     return {
-      content: [...event.content, { type: "text", text: hint } as TextBlock],
+      content: hint
+        ? [...content, { type: "text", text: hint } as TextBlock]
+        : content,
     };
   });
 
