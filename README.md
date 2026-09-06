@@ -176,6 +176,10 @@ A construction failure notifies once and calls `ctx.ui.setFooter(undefined)`, so
 a broken footer degrades to pi's instead of breaking the TUI. `/footer` toggles between the two for
 troubleshooting. The footer is installed only in TUI mode.
 
+When the background extension is loaded and something is running, a third line
+lists the running tasks (`2 background: bg1 just test | bg2 pnpm build`), read
+from the list that extension publishes on `globalThis`.
+
 The line rewriting lives in `footer/render.ts`, free of any pi import, so it can
 be exercised without a terminal: `node --experimental-strip-types
 footer/render.test.ts`.
@@ -344,6 +348,18 @@ marker undefined.
 The bash gate above uses the extension's own state; the marker is for other
 extensions in the same process, which read `active` to tell a sandboxed session
 from an unsandboxed one.
+
+Beside an active marker it also publishes the wrap itself:
+
+```ts
+globalThis.__codassSandboxWrap = (command: string) => Promise<string>;
+```
+
+That is the very function the sandboxed bash runs its own commands through, so
+an extension executing a command outside the bash tool — `background/` does —
+gets byte-for-byte the same confinement instead of rebuilding the jail. It is
+cleared whenever the marker turns inactive, so a reader that finds no wrap must
+fail closed.
 
 ### `trace`
 

@@ -343,6 +343,17 @@ function takeCapture(command: string | undefined): ExecCapture | undefined {
   return entry?.capture;
 }
 
+/** The confinement a command gets before it is handed to `bash -c`. */
+export async function wrapForSandbox(
+  command: string,
+  filesystem: FilesystemConfig,
+): Promise<string> {
+  return applyAllowRead(
+    dropMissingDevNullBinds(await SandboxManager.wrapWithSandbox(command)),
+    filesystem,
+  );
+}
+
 function createSandboxedBashOps(
   trace: boolean,
   filesystem: FilesystemConfig,
@@ -366,10 +377,7 @@ function createSandboxedBashOps(
         inner = `strace -f -e trace=file -e status=failed -o ${shellQuote(tracePath)} bash -c ${shellQuote(command)}`;
       }
 
-      const wrappedCommand = applyAllowRead(
-        dropMissingDevNullBinds(await SandboxManager.wrapWithSandbox(inner)),
-        filesystem,
-      );
+      const wrappedCommand = await wrapForSandbox(inner, filesystem);
 
       return new Promise((resolve, reject) => {
         // Both streams: a wrapper like rtk reports the refusal on stdout.
@@ -612,9 +620,24 @@ export type CodassSandboxMarker = {
   };
 };
 
-function publishMarker(marker: CodassSandboxMarker): void {
-  (globalThis as { __codassSandbox?: CodassSandboxMarker }).__codassSandbox =
-    marker;
+/**
+ * Published beside an active marker, so an extension running a command outside
+ * the bash tool confines it identically instead of rebuilding the jail. It is
+ * the very function `exec` runs its own commands through; it is cleared
+ * whenever the marker turns inactive.
+ */
+export type CodassSandboxWrap = (command: string) => Promise<string>;
+
+function publishMarker(
+  marker: CodassSandboxMarker,
+  wrap?: CodassSandboxWrap,
+): void {
+  const globals = globalThis as {
+    __codassSandbox?: CodassSandboxMarker;
+    __codassSandboxWrap?: CodassSandboxWrap;
+  };
+  globals.__codassSandboxWrap = wrap;
+  globals.__codassSandbox = marker;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -790,16 +813,19 @@ export default function (pi: ExtensionAPI) {
     const { allowRead: _allowRead, ...runtimeFilesystem } = filesystem;
 
     const publishActive = () =>
-      publishMarker({
-        active: true,
-        config: {
-          networkRestricted,
-          allowRead: filesystem.allowRead?.length ?? 0,
-          allowWrite: filesystem.allowWrite?.length ?? 0,
-          denyWrite: filesystem.denyWrite?.length ?? 0,
-          trace: traceEnabled,
+      publishMarker(
+        {
+          active: true,
+          config: {
+            networkRestricted,
+            allowRead: filesystem.allowRead?.length ?? 0,
+            allowWrite: filesystem.allowWrite?.length ?? 0,
+            denyWrite: filesystem.denyWrite?.length ?? 0,
+            trace: traceEnabled,
+          },
         },
-      });
+        (command) => wrapForSandbox(command, filesystem),
+      );
 
     try {
       const configExt = config as unknown as {
