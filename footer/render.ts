@@ -115,11 +115,12 @@ const CONTEXT_FRAGMENT =
   /\d+(?:\.\d+)?[kM]?%?\/\d+(?:\.\d+)?[kM]?(?: \d+(?:\.\d+)?%)?/;
 
 /**
- * Place the automatic-handoff indicator right after the context fragment.
+ * Place an indicator — automatic handoff, the active goal — right after the
+ * context fragment; markers stack in the order they are applied.
  *
- * `undefined` while auto is off, so the fragment is left exactly as it was.
+ * `undefined` while that indicator is off, so the line is left exactly as it was.
  */
-export function autoHandoffMarker(
+export function markAfterContext(
   line: string,
   indicator: string | undefined,
 ): string {

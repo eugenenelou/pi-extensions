@@ -94,6 +94,23 @@ export function settingFromEntries(
   return undefined;
 }
 
+/**
+ * A hold placed by another extension for as long as its loop or goal runs.
+ *
+ * Beyond the threshold it carries what the handoff it triggers must know: the
+ * focus note the baton is written under, that a goal is active, and an entry to
+ * seed into the successor session so the holder re-arms itself there.
+ */
+export interface AutoHold {
+  /** Token count or percentage; the live threshold when absent. */
+  at?: string | number;
+  focus?: string;
+  goalActive?: boolean;
+  seedEntry?: { customType: string; data?: unknown };
+  /** Sent to the successor once the baton is in place, to resume the holder's work. */
+  seedDirective?: string;
+}
+
 export interface Usage {
   tokens: number | null | undefined;
   contextWindow: number;
@@ -102,7 +119,7 @@ export interface Usage {
 export class AutoHandoff {
   private readonly fallback: AutoSetting;
   private conversation: AutoSetting | undefined;
-  private forced: { at: string | number } | undefined;
+  private forced: AutoHold | undefined;
 
   constructor(config: AutoConfig = {}) {
     this.fallback = {
@@ -113,8 +130,9 @@ export class AutoHandoff {
 
   /** What the conversation is running with right now. */
   private live(): AutoSetting {
-    if (this.forced) return { enabled: true, at: this.forced.at };
-    return this.conversation ?? this.fallback;
+    const own = this.conversation ?? this.fallback;
+    if (this.forced) return { enabled: true, at: this.forced.at ?? own.at };
+    return own;
   }
 
   /** The conversation's own setting, or undefined while it follows the config. */
@@ -146,13 +164,18 @@ export class AutoHandoff {
     this.conversation = setting;
   }
 
-  /** Hold auto on at a caller's threshold until `release`. */
-  force(at: string | number = this.live().at): void {
-    this.forced = { at };
+  /** Hold auto on for a caller until `release`. */
+  force(hold: AutoHold = {}): void {
+    this.forced = hold;
   }
 
   release(): void {
     this.forced = undefined;
+  }
+
+  /** The hold in force, which a handoff reads for its focus and its seed entry. */
+  hold(): AutoHold | undefined {
+    return this.forced;
   }
 
   indicator(): string | undefined {

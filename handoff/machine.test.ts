@@ -8,7 +8,9 @@ import {
 } from "./machine.ts";
 
 /** A host whose async steps are resolved by the test, recording every effect. */
-function fakeHost(opts: { idle?: boolean; conversation?: string } = {}) {
+function fakeHost(
+  opts: { idle?: boolean; conversation?: string; resume?: string } = {},
+) {
   const log: string[] = [];
   let idle = opts.idle ?? true;
   let resolveIdle = () => {};
@@ -58,6 +60,7 @@ function fakeHost(opts: { idle?: boolean; conversation?: string } = {}) {
         resolveComplete = res;
         rejectComplete = rej;
       }),
+    resumeMessage: () => opts.resume,
     handoffPath: () => "/s/x.handoff.md",
     writeFile: (p, t) => log.push(`write:${p}:${t}`),
     newSession: async (withSession) => {
@@ -138,6 +141,30 @@ test("idle: writes the file, attaches the handoff first, replays captured inputs
   assert.ok(f.log.indexOf("append") < f.log.indexOf("send:first"));
   assert.equal(m.phase, "idle");
   assert.equal(f.widget, undefined);
+});
+
+test("a seeded resume directive is sent after the baton, ahead of replayed input", async () => {
+  const f = fakeHost({ resume: "Continue the goal" });
+  const m = new HandoffMachine();
+  const done = m.command(f.host, "focus", true);
+  m.onInput("typed", undefined);
+  f.finishHandoff();
+  await done;
+  await tick();
+
+  assert.deepEqual(f.next.sent, ["Continue the goal", "typed"]);
+  assert.ok(f.log.indexOf("append") < f.log.indexOf("send:Continue the goal"));
+});
+
+test("a seeded resume directive is sent even with nothing to replay", async () => {
+  const f = fakeHost({ resume: "Continue the goal" });
+  const m = new HandoffMachine();
+  const done = m.command(f.host, "focus", true);
+  f.finishHandoff();
+  await done;
+  await tick();
+
+  assert.deepEqual(f.next.sent, ["Continue the goal"]);
 });
 
 test("the switch's own session_shutdown must not drop the stash", async () => {

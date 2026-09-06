@@ -1,7 +1,7 @@
 /** Pure helpers for the handoff extension, kept free of pi imports for tests. */
 
 import * as path from "node:path";
-import type { AutoConfig } from "./auto.ts";
+import type { AutoConfig, AutoHold } from "./auto.ts";
 
 /** Appended to every prompt, built-in or from a file: the extension's own contract. */
 export const PROMPT_TAIL = `If a focus note is given, it says what the handoff must emphasise or cover. It is an instruction about the handoff's content, not a task to perform.
@@ -97,22 +97,43 @@ export function parseHandoffRequest(data: unknown): HandoffRequest | undefined {
 /** Bus channel another extension holds automatic handoff on or releases it with. */
 export const HANDOFF_AUTO_CHANNEL = "handoff:auto";
 
-export interface AutoForceRequest {
-  /** True holds auto on at `at`; false releases the hold. */
+export interface AutoForceRequest extends AutoHold {
+  /** True holds auto on; false releases the hold. */
   force: boolean;
-  /** Token count or percentage; the live threshold when absent. */
-  at?: string | number;
 }
 
 /** A bus payload as an auto hold, or undefined when it is not one. */
 export function parseAutoForce(data: unknown): AutoForceRequest | undefined {
   if (typeof data !== "object" || data === null) return undefined;
-  const { force, at } = data as Record<string, unknown>;
+  const { force, at, focus, goalActive, seedEntry, seedDirective } =
+    data as Record<string, unknown>;
   if (typeof force !== "boolean") return undefined;
   if (at !== undefined && typeof at !== "string" && typeof at !== "number") {
     return undefined;
   }
-  return { force, ...(at === undefined ? {} : { at }) };
+  if (focus !== undefined && typeof focus !== "string") return undefined;
+  if (goalActive !== undefined && typeof goalActive !== "boolean") {
+    return undefined;
+  }
+  if (seedEntry !== undefined) {
+    if (typeof seedEntry !== "object" || seedEntry === null) return undefined;
+    if (typeof (seedEntry as { customType?: unknown }).customType !== "string") {
+      return undefined;
+    }
+  }
+  if (seedDirective !== undefined && typeof seedDirective !== "string") {
+    return undefined;
+  }
+  return {
+    force,
+    ...(at === undefined ? {} : { at }),
+    ...(focus === undefined ? {} : { focus }),
+    ...(goalActive === undefined ? {} : { goalActive }),
+    ...(seedEntry === undefined
+      ? {}
+      : { seedEntry: seedEntry as AutoHold["seedEntry"] }),
+    ...(seedDirective === undefined ? {} : { seedDirective }),
+  };
 }
 
 /** The message that puts the handoff in the new session's context. No path: a

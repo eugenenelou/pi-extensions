@@ -13,9 +13,9 @@ import {
   FooterComponent,
 } from "@earendil-works/pi-coding-agent";
 import {
-  autoHandoffMarker,
   backgroundLine,
   fitToWidth,
+  markAfterContext,
   rewriteContextFragment,
 } from "./render.ts";
 
@@ -37,6 +37,17 @@ function backgroundTasks(): { id: string; command: string }[] {
 function autoHandoff(): string | undefined {
   const indicator = (globalThis as { __codassHandoffAuto?: () => string | undefined })
     .__codassHandoffAuto;
+  try {
+    return indicator?.();
+  } catch {
+    return undefined;
+  }
+}
+
+/** The active goal the goal extension publishes, if one runs. */
+function goal(): string | undefined {
+  const indicator = (globalThis as { __codassGoal?: () => string | undefined })
+    .__codassGoal;
   try {
     return indicator?.();
   } catch {
@@ -74,9 +85,15 @@ function applyCustomFooter(ctx: ExtensionContext): void {
           try {
             const lines = [...builtInLines];
             if (lines.length > 1) {
-              lines[1] = autoHandoffMarker(
-                rewriteContextFragment(lines[1], ctx.getContextUsage()?.tokens),
-                autoHandoff(),
+              lines[1] = markAfterContext(
+                markAfterContext(
+                  rewriteContextFragment(
+                    lines[1],
+                    ctx.getContextUsage()?.tokens,
+                  ),
+                  autoHandoff(),
+                ),
+                goal(),
               );
             }
             const background = backgroundLine(backgroundTasks(), width);

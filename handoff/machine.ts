@@ -40,6 +40,13 @@ export interface Host {
     input: string,
     signal: AbortSignal,
   ): Promise<string | null>;
+  /**
+   * A directive to resume a holder's work in the successor, or undefined.
+   *
+   * Sent after the baton, never before: the baton stays the first entry of the
+   * new conversation, and the directive reads against it.
+   */
+  resumeMessage(): string | undefined;
   handoffPath(): string;
   writeFile(path: string, text: string): void;
   newSession(
@@ -204,7 +211,8 @@ export class HandoffMachine {
     this.setPhase(host, "switching");
     const result = await host.newSession(async (next) => {
       next.appendMessage(buildAttachment(handoff));
-      const toReplay = this.stash;
+      const resume = host.resumeMessage();
+      const toReplay = resume ? [resume, ...this.stash] : this.stash;
       this.stash = [];
       this.phase = "idle";
       this.host = undefined;

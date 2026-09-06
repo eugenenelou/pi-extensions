@@ -512,3 +512,47 @@ starts in `session_start` and stops in `session_shutdown`. Nothing assumes a TUI
 ```
 node --experimental-strip-types --test loop/machine.test.ts loop/lib.test.ts
 ```
+
+## `goal/`
+
+`/goal <condition>` works towards a condition until it is reached, mirroring
+Claude Code's own `/goal`. The condition is stored in the session and starts a
+turn as the directive. After every agent run — once, however many turns the run
+took — the `judge` model (`~/.pi/agent/extensions/judge.json`, the session's
+model when none is set) reads the condition and the conversation and answers on
+two lines:
+
+```
+VERDICT: met | not-yet | impossible
+REASON: …
+```
+
+`not yet` sends the reason back as the next run's instruction, once the session
+is idle again, so the session drives itself. `met` and `impossible` write the
+verdict into the conversation and clear the goal. A judge that does not answer
+one of the three — or that hangs past its timeout — leaves the goal armed rather
+than ending it.
+
+`/goal` alone reports the condition, the elapsed time, the number of evaluated
+runs and the last reason; `/goal clear` drops it. Three runs in a row without a
+tool call stop the self-driving with a warning — the goal stays set and the
+next message the user types resumes it, since the agent talking to itself is
+the shape a stalled goal takes.
+
+While a goal is active it holds automatic handoff on at the handoff default
+threshold through `handoff:auto`, with the goal as the baton's focus note and
+the goal entry as the successor's seed. The handoff writes that entry into the
+new session and, once the baton is in place as its first entry, sends the
+directive that resumes the goal there. The hold is released when the session
+shuts down and when a session starts with no goal in it, so a later goal-less
+conversation is not left handing off with a stale focus. Resuming a session with
+an active goal re-arms it too, with a fresh timer and run count, but without
+starting a turn. The footer shows `goal: <condition>` beside the
+automatic-handoff marker. Everything works headless: no dialog, no widget, and the machine never assumes a TUI.
+
+`goal/machine.ts` is the machine over a `GoalHost` interface with no pi imports;
+`index.ts` builds the host from the extension context.
+
+```
+node --experimental-strip-types --test goal/machine.test.ts goal/lib.test.ts
+```

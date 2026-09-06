@@ -27,6 +27,7 @@ import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import {
   AUTO_ENTRY_TYPE,
   AutoHandoff,
+  type AutoHold,
   type AutoSetting,
   parseAutoCommand,
   settingFromEntries,
@@ -132,6 +133,7 @@ function setWidget(ctx: ExtensionContext, lines: string[] | undefined): void {
 function hostFor(
   ctx: ExtensionCommandContext,
   setting: AutoSetting | undefined,
+  hold: AutoHold | undefined,
 ): Host {
   return {
     isIdle: () => ctx.isIdle(),
@@ -168,6 +170,7 @@ function hostFor(
         .trim();
       return text || null;
     },
+    resumeMessage: () => hold?.seedDirective,
     handoffPath: () =>
       handoffPathFor(
         ctx.sessionManager.getSessionFile(),
@@ -185,6 +188,13 @@ function hostFor(
         // setting only carries over if it is written into it.
         setup: async (sessionManager) => {
           if (setting) sessionManager.appendCustomEntry(AUTO_ENTRY_TYPE, setting);
+          // The holder re-arms itself from this entry in the successor.
+          if (hold?.seedEntry) {
+            sessionManager.appendCustomEntry(
+              hold.seedEntry.customType,
+              hold.seedEntry.data,
+            );
+          }
         },
         withSession: async (next) => {
           await withSession({
@@ -222,19 +232,25 @@ export default function (pi: ExtensionAPI) {
   pi.events.on(HANDOFF_REQUEST_CHANNEL, (data) => {
     const request = parseHandoffRequest(data);
     if (!request) return;
-    if (request.threshold !== undefined) auto.force(request.threshold);
+    if (request.threshold !== undefined) {
+      auto.force({ ...auto.hold(), at: request.threshold });
+    }
     run(request);
   });
 
   pi.events.on(HANDOFF_AUTO_CHANNEL, (data) => {
     const hold = parseAutoForce(data);
     if (!hold) return;
-    if (hold.force) auto.force(hold.at);
+    if (hold.force) auto.force(hold);
     else auto.release();
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    // Extensions get `session_start` in load order, so a hold placed by one that
+    // loads earlier must survive the rebuild of this conversation's setting.
+    const hold = auto.hold();
     auto = new AutoHandoff(loadConfig(ctx.cwd).auto);
+    if (hold) auto.force(hold);
     const setting = settingFromEntries(ctx.sessionManager.getBranch());
     if (setting) auto.restore(setting);
     // The footer reads the indicator from here; it cannot import this module.
@@ -244,7 +260,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_end", async (_event, ctx) => {
     if (!auto.shouldHandoff(ctx.getContextUsage())) return;
-    run({ focus: "", goalActive: false });
+    const hold = auto.hold();
+    run({ focus: hold?.focus ?? "", goalActive: hold?.goalActive ?? false });
   });
 
   pi.on("input", async (event) => {
@@ -287,7 +304,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("No model selected", "error");
         return;
       }
-      const host = hostFor(ctx, auto.setting());
+      const host = hostFor(ctx, auto.setting(), auto.hold());
       // Not awaited: pi's input loop waits for this handler, and inputs typed
       // while it runs would be held back from the input event.
       void (request

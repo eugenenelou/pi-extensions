@@ -5,9 +5,9 @@
 
 import assert from "node:assert/strict";
 import {
-  autoHandoffMarker,
   backgroundLine,
   fitToWidth,
+  markAfterContext,
   rewriteContextFragment,
   visibleWidth,
 } from "./render.ts";
@@ -88,14 +88,21 @@ assert.equal(visibleWidth(NARROW_LINE), 30);
 
 // The auto-handoff indicator rides beside the context fragment, and only when on.
 const AUTO = rewriteContextFragment(PLAIN, 17000);
-assert.equal(autoHandoffMarker(AUTO, undefined), AUTO);
+assert.equal(markAfterContext(AUTO, undefined), AUTO);
 assert.equal(
-  autoHandoffMarker(AUTO, "auto-handoff@80%"),
+  markAfterContext(AUTO, "auto-handoff@80%"),
   "↑17k ↓114 R50k CH98.9% $0.115 (sub) 17k/272k 6.2% auto-handoff@80% (auto)   gpt-5.6-sol • high",
 );
 assert.match(
-  autoHandoffMarker(rewriteContextFragment(COLOURED, 256000), "auto-handoff@150k"),
+  markAfterContext(rewriteContextFragment(COLOURED, 256000), "auto-handoff@150k"),
   /94\.2% auto-handoff@150k/,
 );
+
+const MARKED = "  main  6.2%/272k  model";
+assert.equal(
+  markAfterContext(markAfterContext(MARKED, "auto-handoff@80%"), "goal: ship it"),
+  "  main  6.2%/272k goal: ship it auto-handoff@80%  model",
+);
+assert.equal(markAfterContext(MARKED, undefined), MARKED);
 
 console.log("footer render rewrite: ok");

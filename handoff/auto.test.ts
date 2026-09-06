@@ -137,7 +137,7 @@ test("no setting to inherit when the session has none", () => {
 test("a forced threshold overrides the conversation and releasing restores it", () => {
   const auto = new AutoHandoff({ enabled: false, at: "80%" });
   auto.apply({ kind: "at", at: "90%" });
-  auto.force("40%");
+  auto.force({ at: "40%" });
   assert.equal(
     auto.shouldHandoff({ tokens: 120000, contextWindow: 272000 }),
     true,
@@ -156,7 +156,7 @@ test("a forced threshold overrides the conversation and releasing restores it", 
 
   // Forcing over an auto that was off leaves it off again after the release.
   const off = new AutoHandoff({ enabled: false, at: "80%" });
-  off.force("40%");
+  off.force({ at: "40%" });
   assert.equal(
     off.shouldHandoff({ tokens: 120000, contextWindow: 272000 }),
     true,
@@ -181,9 +181,28 @@ test("the indicator shows the live threshold only while auto is on", () => {
   assert.equal(auto.indicator(), "auto-handoff@80%");
   auto.apply({ kind: "at", at: "150k" });
   assert.equal(auto.indicator(), "auto-handoff@150k");
-  auto.force("40%");
+  auto.force({ at: "40%" });
   assert.equal(auto.indicator(), "auto-handoff@40%");
   auto.release();
   auto.apply({ kind: "off" });
   assert.equal(auto.indicator(), undefined);
+});
+
+test("a hold carries the focus and the seed entry of whoever placed it", () => {
+  const auto = new AutoHandoff({ enabled: false, at: "80%" });
+  assert.equal(auto.hold(), undefined);
+  auto.force({
+    at: "40%",
+    focus: "the goal",
+    goalActive: true,
+    seedEntry: { customType: "goal", data: { condition: "green" } },
+  });
+  assert.equal(auto.hold()?.focus, "the goal");
+  assert.equal(auto.hold()?.goalActive, true);
+  assert.deepEqual(auto.hold()?.seedEntry, {
+    customType: "goal",
+    data: { condition: "green" },
+  });
+  auto.release();
+  assert.equal(auto.hold(), undefined);
 });
