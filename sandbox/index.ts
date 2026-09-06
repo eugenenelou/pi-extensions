@@ -48,9 +48,11 @@ import { spawn, spawnSync } from "node:child_process";
 import {
   appendFileSync,
   existsSync,
+  mkdirSync,
   readFileSync,
   readlinkSync,
   realpathSync,
+  writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -58,6 +60,7 @@ import {
   SandboxManager,
   type SandboxRuntimeConfig,
 } from "@anthropic-ai/sandbox-runtime";
+import type { Api, Model, ThinkingLevel } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -69,6 +72,18 @@ import {
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { capBashOutput } from "./bash-output.ts";
+import {
+  JUDGE_SYSTEM_PROMPT,
+  PermissionMachine,
+  type AllowRule,
+  type PermissionConfig,
+  type PermissionHost,
+  type StoredScope,
+  type ToolCall,
+  type Verdict,
+  parseVerdict,
+  subjectOf,
+} from "./permissions.ts";
 
 type FilesystemConfig = Partial<SandboxRuntimeConfig["filesystem"]> & {
   /**
@@ -480,30 +495,6 @@ function sandboxHint(capture: ExecCapture): string | undefined {
   return `<sandbox_hint>\n${parts.join("\n")}\n</sandbox_hint>`;
 }
 
-type Guard = { reason: string; pattern: RegExp };
-
-// pi has no permission prompts of its own, so this list is the whole of it:
-// keep it short and obvious.
-const GUARDS: Guard[] = [
-  { reason: "git push", pattern: /\bgit\s+(?:-\S+\s+)*push\b/ },
-  {
-    reason: "git push --force",
-    pattern:
-      /\bgit\s+(?:-\S+\s+)*push\b[^;&|]*\s(?:--force(?:-with-lease)?|-f)\b/,
-  },
-  { reason: "git stash", pattern: /\bgit\s+(?:-\S+\s+)*stash\b/ },
-  { reason: "git -C", pattern: /\bgit\s+-C\b/ },
-  // Any first non-flag operand that does not start with /tmp is outside the
-  // scratchpad root (/tmp/claude-*) too; a relative path resolves inside the
-  // worktree, which is likewise off limits.
-  {
-    reason: "rm -rf outside /tmp",
-    pattern:
-      /\brm\s+(?=(?:-\S+\s+)*-\S*[rR])(?:-\S+\s+)+(?!\/tmp(?:\/|\s|$))\S/,
-  },
-  { reason: "sudo", pattern: /\bsudo\b/ },
-];
-
 // The sandbox covers bash only; these tools reach the filesystem directly.
 const PATH_TOOLS = new Set(["read", "write", "edit", "grep", "find", "ls"]);
 
@@ -523,12 +514,6 @@ function announceOnce(
   sandboxAnnounced = true;
   if (ctx.hasUI) ctx.ui.notify(message, level);
   else console.error(message);
-}
-
-function guardReason(command: string): string | undefined {
-  // A wrapper prefix must not hide what actually runs.
-  const probe = command.replace(/^\s*rtk\s+/, "");
-  return GUARDS.find((guard) => guard.pattern.test(probe))?.reason;
 }
 
 function envPathReason(path: unknown): string | undefined {
@@ -601,6 +586,151 @@ function sandboxPathReason(
   return `read of ${path}: hidden by the sandbox denyRead list`;
 }
 
+type RuleFile = { config: PermissionConfig } | { error: string } | undefined;
+
+/**
+ * The rendered permission lists, and the rules the dialog remembered.
+ *
+ * codass writes the fixed lists at deploy: `<agent dir>/extensions/permissions.json`
+ * for a profile, `<cwd>/.pi/permissions.json` for a project, and the two are
+ * unioned. A grant made from the dialog is written beside them, in
+ * `permissions.local.json`, so a redeploy never overwrites it.
+ *
+ * A file that is absent reads as undefined; one that is there but unparseable
+ * reads as an error, which makes the machine fail closed.
+ */
+function readRuleFile(file: string): RuleFile {
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf-8");
+  } catch {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { error: `${file}: not a JSON object` };
+    }
+    return { config: parsed as PermissionConfig };
+  } catch (err) {
+    return {
+      error: `${file}: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+function ruleFileConfig(file: string): PermissionConfig {
+  const read = readRuleFile(file);
+  return read && "config" in read ? read.config : {};
+}
+
+function permissionFiles(cwd: string): string[] {
+  return [
+    join(getAgentDir(), "extensions", "permissions.json"),
+    join(cwd, CONFIG_DIR_NAME, "permissions.json"),
+  ];
+}
+
+function loadPermissionConfig(cwd: string): PermissionConfig {
+  const configs = permissionFiles(cwd).map(ruleFileConfig);
+  const errors = [
+    ...permissionFiles(cwd),
+    localRulesPath("global", cwd),
+    localRulesPath("worktree", cwd),
+  ].flatMap((file) => {
+    const read = readRuleFile(file);
+    return read && "error" in read ? [read.error] : [];
+  });
+  return {
+    deny: configs.flatMap((config) => config.deny ?? []),
+    allow: [...new Set(configs.flatMap((config) => config.allow ?? []))],
+    unreadable: errors.length ? errors.join("; ") : undefined,
+  };
+}
+
+function localRulesPath(scope: StoredScope, cwd: string): string {
+  return scope === "global"
+    ? join(getAgentDir(), "extensions", "permissions.local.json")
+    : join(cwd, CONFIG_DIR_NAME, "permissions.local.json");
+}
+
+let announcedUnreadable: string | undefined;
+
+/** Failing closed is invisible otherwise: say once why every call now asks. */
+function announceUnreadable(ctx: GuardCtx, message: string): void {
+  if (announcedUnreadable === message) return;
+  announcedUnreadable = message;
+  const text = `permission rules unreadable, failing closed: ${message}`;
+  if (ctx.hasUI) ctx.ui.notify(text, "error");
+  else console.error(text);
+}
+
+/** The `judge` model role codass renders beside the extension configs. */
+function judgeModel(ctx: ExtensionContext): {
+  model: Model<Api> | undefined;
+  thinking?: ThinkingLevel;
+} {
+  const setting = ruleFileConfig(
+    join(getAgentDir(), "extensions", "judge.json"),
+  ) as unknown as {
+    provider?: string;
+    model?: string;
+    thinking?: ThinkingLevel;
+  };
+  const model =
+    setting.provider && setting.model
+      ? ctx.modelRegistry.getModel(setting.provider, setting.model)
+      : undefined;
+  return { model: model ?? ctx.model, thinking: setting.thinking };
+}
+
+/** The tool call as the model wrote it, for the judge to read. */
+function judgeInput(call: ToolCall, cwd: string): string {
+  const rendered = subjectOf(call);
+  const subject =
+    call.toolName === "bash"
+      ? `command: ${call.command}`
+      : typeof call.path === "string"
+        ? `path: ${call.path}`
+        : `arguments: ${rendered || "(too large to render)"}`;
+  return `working directory: ${cwd}\ntool: ${call.toolName}\n${subject}`;
+}
+
+async function askJudge(
+  ctx: ExtensionContext,
+  call: ToolCall,
+  signal: AbortSignal,
+): Promise<Verdict> {
+  const { model, thinking } = judgeModel(ctx);
+  if (!model) return { verdict: "ask", reason: "no judge model configured" };
+  try {
+    const response = await ctx.modelRegistry.completeSimple(
+      model,
+      {
+        systemPrompt: JUDGE_SYSTEM_PROMPT,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: judgeInput(call, ctx.cwd) }],
+            timestamp: Date.now(),
+          },
+        ],
+      },
+      { cacheRetention: "none", reasoning: thinking, signal },
+    );
+    const text = response.content
+      .filter((block): block is TextBlock => block.type === "text")
+      .map((block) => block.text)
+      .join("\n");
+    return parseVerdict(text);
+  } catch (err) {
+    return {
+      verdict: "ask",
+      reason: `judge unavailable (${err instanceof Error ? err.message : err})`,
+    };
+  }
+}
+
 /**
  * Session marker other extensions read to know whether bash is really
  * sandboxed. It is published on `globalThis` only once the bash override is
@@ -652,6 +782,31 @@ export default function (pi: ExtensionAPI) {
 
   let sandboxEnabled = false;
   let sandboxInitialized = false;
+  /**
+   * The context of the call being decided. The machine outlives any single
+   * call — its conversation-scoped grants do — so the host reads the live one
+   * instead of capturing it.
+   */
+  let deciding: ExtensionContext | undefined;
+  const permissionHost: PermissionHost = {
+    hasUI: () => deciding?.hasUI ?? false,
+    readRules: (scope) => {
+      const cwd = deciding?.cwd ?? localCwd;
+      return ruleFileConfig(localRulesPath(scope, cwd)).allow ?? [];
+    },
+    writeRules: (scope, rules: AllowRule[]) => {
+      const path = localRulesPath(scope, deciding?.cwd ?? localCwd);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, `${JSON.stringify({ allow: rules }, null, 2)}\n`);
+    },
+    judge: (call, signal) =>
+      deciding
+        ? askJudge(deciding, call, signal)
+        : Promise.resolve({ verdict: "ask", reason: "no session context" }),
+    select: async (message, choices) =>
+      deciding?.hasUI ? deciding.ui.select(message, choices) : undefined,
+  };
+  const permissions = new PermissionMachine({}, permissionHost);
   let filesystem: FilesystemConfig = {};
   let traceEnabled = false;
 
@@ -692,6 +847,40 @@ export default function (pi: ExtensionAPI) {
     return SANDBOX_BLOCK;
   };
 
+  /**
+   * Deny list, then allow list, then the judge — skipped entirely when codass
+   * has deployed no lists, so an unconfigured setup keeps pi's own behaviour.
+   */
+  const decide = async (
+    toolName: string,
+    input: { command?: string; path?: unknown },
+    ctx: ExtensionContext,
+  ) => {
+    const config = loadPermissionConfig(ctx.cwd);
+    if (!config.unreadable && !config.deny?.length && !config.allow?.length) {
+      return undefined;
+    }
+    if (config.unreadable) announceUnreadable(ctx, config.unreadable);
+    permissions.setConfig(config);
+    deciding = ctx;
+    const decision = await permissions.decide({
+      toolName,
+      command: input.command,
+      path: typeof input.path === "string" ? input.path : undefined,
+      input,
+    });
+    if (decision) {
+      logDenial({
+        cwd: ctx.cwd,
+        tool: toolName,
+        command: input.command,
+        path: input.path,
+        reason: decision.reason,
+      });
+    }
+    return decision;
+  };
+
   pi.on("tool_call", async (event, ctx) => {
     const input = event.input as { command?: string; path?: unknown };
     let reason: string | undefined;
@@ -709,7 +898,6 @@ export default function (pi: ExtensionAPI) {
         });
         return { block: true, reason: gateReason };
       }
-      reason = guardReason(input.command);
     } else if (PATH_TOOLS.has(event.toolName)) {
       // Only writes to an env file are guarded; reading one is allowed.
       if (event.toolName === "write" || event.toolName === "edit") {
@@ -726,7 +914,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    if (!reason) return undefined;
+    if (!reason) return decide(event.toolName, input, ctx);
     const message = `sandbox guard: ${reason}`;
     const blocked =
       !ctx.hasUI ||
@@ -769,6 +957,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    permissions.reset();
     const noSandbox = pi.getFlag("no-sandbox") as boolean;
 
     if (noSandbox) {
