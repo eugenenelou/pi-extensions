@@ -9,13 +9,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { sandboxPathReason } from "./index.ts";
+import { applyAllowRead, sandboxPathReason } from "./index.ts";
 
 /** The baseline codass renders: `PI_PERMISSION_ALLOW` in the pi target. */
 const BASELINE = ["edit", "find", "grep", "ls", "read", "write"];
@@ -116,6 +116,17 @@ test("the sandbox-path guard refuses a write outside allowWrite", () => {
       allowWrite: ["/work"],
     }) ?? "",
     /outside the sandbox allowWrite list/,
+  );
+});
+
+test("a relative allowRead entry is bound at its path under the cwd", () => {
+  const bound = applyAllowRead(
+    `bwrap --ro-bind / / --tmpfs ${homedir()} --ro-bind /tmp /tmp -- bash -c true`,
+    { allowRead: ["."] },
+  );
+  assert.ok(
+    bound.includes(`--ro-bind ${process.cwd()} ${process.cwd()} `),
+    bound,
   );
 });
 

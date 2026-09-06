@@ -233,7 +233,10 @@ function escapeRegExp(value: string): string {
  * bound read-only right after it, and every write bind and deny the runtime
  * produced keeps its place behind them.
  */
-function applyAllowRead(command: string, filesystem: FilesystemConfig): string {
+export function applyAllowRead(
+  command: string,
+  filesystem: FilesystemConfig,
+): string {
   if (!command.startsWith("bwrap ")) return command;
 
   const sep = command.search(/ -- (?!-)/);
@@ -247,7 +250,9 @@ function applyAllowRead(command: string, filesystem: FilesystemConfig): string {
   if (!homeTmpfs.test(argv)) return command;
 
   // Parents first: a later parent bind would shadow the child mounted before it.
-  const allowRead = [...new Set((filesystem.allowRead ?? []).map(expandPath))]
+  const allowRead = [
+    ...new Set((filesystem.allowRead ?? []).map((entry) => expandPath(entry))),
+  ]
     .filter(existsSync)
     .sort((a, b) => a.length - b.length);
 
