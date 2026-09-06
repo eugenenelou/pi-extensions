@@ -180,14 +180,16 @@ footer/render.test.ts`.
 
 ## `sandbox/`
 
-OS-level sandboxing of the `bash` tool via `@anthropic-ai/sandbox-runtime`
-(bubblewrap on Linux, sandbox-exec on macOS). Vendored from pi-mono
-`examples/extensions/sandbox/`.
+The security extension. OS-level sandboxing of the `bash` tool via
+`@anthropic-ai/sandbox-runtime` (bubblewrap on Linux, sandbox-exec on macOS),
+vendored from pi-mono `examples/extensions/sandbox/`, plus the guards that cover
+what the jail does not: a deny list of dangerous commands, and the file tools,
+which reach the filesystem directly.
 
 Config is merged from `~/.pi/agent/extensions/sandbox.json` then
 `<cwd>/.pi/sandbox.json` (project wins), on top of the extension defaults.
 
-Three deliberate changes to the upstream file:
+Four deliberate changes to the upstream file:
 
 1. `DEFAULT_CONFIG.network` is `{}` instead of an npm/pypi/github allowlist.
    Leaving `network.allowedDomains` undefined is the only way to get an
@@ -197,6 +199,8 @@ Three deliberate changes to the upstream file:
    below.
 3. `filesystem.allowRead`, denied-access capture and `trace` — three additions
    the runtime does not have. See below.
+4. The command guards, the `.env` and sandbox-path guards on the file tools,
+   and the bash gate. See below.
 
 ### Network and socat
 
@@ -276,11 +280,32 @@ pi:
     allow_write: [...]  # replaces codass' default list (worktree and /tmp stay)
 ```
 
-### Denied-access capture
+### Guards
 
-The same policy file is read by the codass-generated `codass-hooks.ts`, which
-applies it to pi's `read`/`write`/`edit`/`grep`/`find`/`ls` tools — they reach
-the filesystem directly, not through the sandboxed bash.
+A `tool_call` handler covers what the bash jail cannot:
+
+- **Commands.** `git push`, `git push --force`, `git stash`, `git -C`, `sudo`,
+  and `rm -r` whose first operand is outside `/tmp`. A leading `rtk ` is
+  stripped before matching, so a wrapper prefix cannot hide what runs.
+- **`.env` writes.** The `write` and `edit` tools refuse a path whose basename
+  starts with `.env`. Reads are not guarded.
+- **Sandbox paths.** `read`/`write`/`edit`/`grep`/`find`/`ls` are answered from
+  the very config the jail was built with: a write outside `allowWrite` or
+  inside `denyWrite`, and a read under a `denyRead` entry that no `allowRead`
+  or `allowWrite` entry exposes. Everything the jail leaves visible stays
+  readable. A disabled sandbox has no policy, so this guard is off with it.
+
+Each is a prompt, not a hard block: with a UI the user picks `Block` or
+`Allow once`; without one (`--print`, `--mode json`) it blocks.
+
+### Bash gate
+
+`bash` is refused outright unless the sandbox is in force, so a session where
+initialization never ran fails closed instead of falling back to pi's
+unsandboxed bash. `PI_SANDBOX_OFF=1` in the environment is the explicit opt-out;
+it is announced loudly once per session.
+
+### Denied-access capture
 
 Both enforcement points append one JSON line per refusal to
 `~/.pi/agent/sandbox-denials.log`, written by the pi process, outside the jail:
@@ -288,7 +313,8 @@ Both enforcement points append one JSON line per refusal to
 - sandbox: `{ts, cwd, command, line}` for each stderr line of a failed command
   matching `Read-only file system`, `Permission denied`, `No such file or
   directory` or `Operation not permitted` (10 lines per command at most)
-- hooks: `{ts, cwd, tool, path, reason}` for each blocked file-tool call
+- guards: `{ts, cwd, tool, path, reason}` for each blocked file-tool call, and
+  `{ts, cwd, tool, command, reason}` for a bash call the gate refused
 
 A failed sandboxed command also carries a `<sandbox_hint>` block appended to its
 tool result, listing those lines and pointing at the allow list, so the model
@@ -313,11 +339,9 @@ unsandboxed publishes `{ active: false, reason }` instead: `--no-sandbox`,
 failure that is not the socat case. A load failure of this file leaves the
 marker undefined.
 
-The `codass-hooks.ts` extension codass generates depends on this: at each `bash`
-`tool_call` it reads the marker and blocks the call unless `active` is true, so
-a sandbox that never registered fails closed instead of falling back to pi's
-built-in unsandboxed bash. `PI_SANDBOX_OFF=1` in the environment is the explicit
-opt-out; the hooks extension notifies loudly once per session when it is used.
+The bash gate above uses the extension's own state; the marker is for other
+extensions in the same process, which read `active` to tell a sandboxed session
+from an unsandboxed one.
 
 ### `trace`
 

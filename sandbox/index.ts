@@ -47,12 +47,15 @@ import { randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import {
   SandboxManager,
   type SandboxRuntimeConfig,
 } from "@anthropic-ai/sandbox-runtime";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import {
   type BashOperations,
   CONFIG_DIR_NAME,
@@ -184,10 +187,10 @@ function dropMissingDevNullBinds(command: string): string {
 const HOME = homedir();
 
 /** Absolute path for a config entry, expanding a leading `~`. */
-function expandPath(pathPattern: string): string {
+function expandPath(pathPattern: string, cwd: string = process.cwd()): string {
   if (pathPattern === "~") return HOME;
   if (pathPattern.startsWith("~/")) return join(HOME, pathPattern.slice(2));
-  return resolve(pathPattern);
+  return resolve(cwd, pathPattern);
 }
 
 function shellQuote(value: string): string {
@@ -462,6 +465,101 @@ function sandboxHint(capture: ExecCapture): string | undefined {
   return `<sandbox_hint>\n${parts.join("\n")}\n</sandbox_hint>`;
 }
 
+type Guard = { reason: string; pattern: RegExp };
+
+// pi has no permission prompts of its own, so this list is the whole of it:
+// keep it short and obvious.
+const GUARDS: Guard[] = [
+  { reason: "git push", pattern: /\bgit\s+(?:-\S+\s+)*push\b/ },
+  {
+    reason: "git push --force",
+    pattern:
+      /\bgit\s+(?:-\S+\s+)*push\b[^;&|]*\s(?:--force(?:-with-lease)?|-f)\b/,
+  },
+  { reason: "git stash", pattern: /\bgit\s+(?:-\S+\s+)*stash\b/ },
+  { reason: "git -C", pattern: /\bgit\s+-C\b/ },
+  // Any first non-flag operand that does not start with /tmp is outside the
+  // scratchpad root (/tmp/claude-*) too; a relative path resolves inside the
+  // worktree, which is likewise off limits.
+  {
+    reason: "rm -rf outside /tmp",
+    pattern:
+      /\brm\s+(?=(?:-\S+\s+)*-\S*[rR])(?:-\S+\s+)+(?!\/tmp(?:\/|\s|$))\S/,
+  },
+  { reason: "sudo", pattern: /\bsudo\b/ },
+];
+
+// The sandbox covers bash only; these tools reach the filesystem directly.
+const PATH_TOOLS = new Set(["read", "write", "edit", "grep", "find", "ls"]);
+
+const SANDBOX_BLOCK =
+  "sandbox is not active; refusing bash (set PI_SANDBOX_OFF=1 to run unsandboxed on purpose)";
+
+type GuardCtx = Pick<ExtensionContext, "cwd" | "hasUI" | "ui">;
+
+let sandboxAnnounced = false;
+
+function announceOnce(
+  ctx: GuardCtx,
+  message: string,
+  level: "info" | "warning" | "error",
+): void {
+  if (sandboxAnnounced) return;
+  sandboxAnnounced = true;
+  if (ctx.hasUI) ctx.ui.notify(message, level);
+  else console.error(message);
+}
+
+function guardReason(command: string): string | undefined {
+  // A wrapper prefix must not hide what actually runs.
+  const probe = command.replace(/^\s*rtk\s+/, "");
+  return GUARDS.find((guard) => guard.pattern.test(probe))?.reason;
+}
+
+function envPathReason(path: unknown): string | undefined {
+  if (typeof path !== "string") return undefined;
+  const name = basename(path);
+  return name.startsWith(".env") ? `write to ${name}` : undefined;
+}
+
+function isUnder(path: string, parent: string): boolean {
+  const root = parent.endsWith("/") ? parent.slice(0, -1) : parent;
+  return path === root || path.startsWith(`${root}/`);
+}
+
+/** The rules the jail applies to bash, applied to a file-tool path. */
+function sandboxPathReason(
+  tool: string,
+  rawPath: unknown,
+  cwd: string,
+  policy: FilesystemConfig,
+): string | undefined {
+  if (typeof rawPath !== "string" || !rawPath) return undefined;
+  const entries = (
+    key: "allowRead" | "allowWrite" | "denyRead" | "denyWrite",
+  ): string[] => (policy[key] ?? []).map((entry) => expandPath(entry, cwd));
+
+  const allowWrite = entries("allowWrite");
+  if (allowWrite.length === 0) return undefined;
+
+  const path = expandPath(rawPath, cwd);
+  if (tool === "write" || tool === "edit") {
+    if (entries("denyWrite").some((entry) => isUnder(path, entry))) {
+      return `write to ${path}: sandbox denyWrite`;
+    }
+    if (!allowWrite.some((entry) => isUnder(path, entry))) {
+      return `write to ${path}: outside the sandbox allowWrite list`;
+    }
+    return undefined;
+  }
+  if (!entries("denyRead").some((entry) => isUnder(path, entry))) {
+    return undefined;
+  }
+  const readable = [...entries("allowRead"), ...allowWrite];
+  if (readable.some((entry) => isUnder(path, entry))) return undefined;
+  return `read of ${path}: hidden by the sandbox denyRead list`;
+}
+
 /**
  * Session marker other extensions read to know whether bash is really
  * sandboxed. It is published on `globalThis` only once the bash override is
@@ -521,6 +619,71 @@ export default function (pi: ExtensionAPI) {
     return {
       operations: createSandboxedBashOps(traceEnabled, filesystem),
     };
+  });
+
+  /**
+   * Bash is refused unless the sandbox is really in force: a session where
+   * initialization never ran would otherwise fall back to pi's unsandboxed
+   * bash. Checked at call time, never at load — `session_start` decides it.
+   */
+  const sandboxGate = (ctx: GuardCtx): string | undefined => {
+    if (process.env.PI_SANDBOX_OFF === "1") {
+      announceOnce(ctx, "PI_SANDBOX_OFF=1 — bash runs UNSANDBOXED", "warning");
+      return undefined;
+    }
+    if (sandboxEnabled && sandboxInitialized) return undefined;
+    announceOnce(ctx, SANDBOX_BLOCK, "error");
+    return SANDBOX_BLOCK;
+  };
+
+  pi.on("tool_call", async (event, ctx) => {
+    const input = event.input as { command?: string; path?: unknown };
+    let reason: string | undefined;
+    let pathReason: string | undefined;
+
+    if (event.toolName === "bash") {
+      if (typeof input.command !== "string") return undefined;
+      const gateReason = sandboxGate(ctx);
+      if (gateReason) {
+        logDenial({
+          cwd: ctx.cwd,
+          tool: "bash",
+          command: input.command,
+          reason: gateReason,
+        });
+        return { block: true, reason: gateReason };
+      }
+      reason = guardReason(input.command);
+    } else if (PATH_TOOLS.has(event.toolName)) {
+      // Only writes to an env file are guarded; reading one is allowed.
+      if (event.toolName === "write" || event.toolName === "edit") {
+        reason = envPathReason(input.path);
+      }
+      if (!reason) {
+        pathReason = sandboxPathReason(
+          event.toolName,
+          input.path,
+          ctx.cwd,
+          filesystem,
+        );
+        reason = pathReason;
+      }
+    }
+
+    if (!reason) return undefined;
+    const message = `sandbox guard: ${reason}`;
+    const blocked =
+      !ctx.hasUI ||
+      (await ctx.ui.select(message, ["Block", "Allow once"])) !== "Allow once";
+    if (blocked && pathReason) {
+      logDenial({
+        cwd: ctx.cwd,
+        tool: event.toolName,
+        path: input.path,
+        reason: pathReason,
+      });
+    }
+    return blocked ? { block: true, reason: message } : undefined;
   });
 
   pi.on("tool_result", (event) => {
