@@ -45,9 +45,15 @@
 
 import { randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   SandboxManager,
   type SandboxRuntimeConfig,
@@ -522,6 +528,32 @@ function envPathReason(path: unknown): string | undefined {
   return name.startsWith(".env") ? `write to ${name}` : undefined;
 }
 
+/**
+ * Real path of the nearest existing ancestor plus the missing tail, following
+ * dangling links, so a symlink at any component cannot redirect out of the roots.
+ */
+function resolveRealPath(path: string): string {
+  let head = path;
+  const tail: string[] = [];
+  for (let hop = 0; hop < 40; hop++) {
+    try {
+      return join(realpathSync(head), ...tail);
+    } catch {
+      try {
+        head = resolve(dirname(head), readlinkSync(head));
+        continue;
+      } catch {
+        // Not a link: retry on the parent with this component held back.
+      }
+      const parent = dirname(head);
+      if (parent === head) return path;
+      tail.unshift(basename(head));
+      head = parent;
+    }
+  }
+  return path;
+}
+
 function isUnder(path: string, parent: string): boolean {
   const root = parent.endsWith("/") ? parent.slice(0, -1) : parent;
   return path === root || path.startsWith(`${root}/`);
@@ -542,7 +574,7 @@ function sandboxPathReason(
   const allowWrite = entries("allowWrite");
   if (allowWrite.length === 0) return undefined;
 
-  const path = expandPath(rawPath, cwd);
+  const path = resolveRealPath(expandPath(rawPath, cwd));
   if (tool === "write" || tool === "edit") {
     if (entries("denyWrite").some((entry) => isUnder(path, entry))) {
       return `write to ${path}: sandbox denyWrite`;
