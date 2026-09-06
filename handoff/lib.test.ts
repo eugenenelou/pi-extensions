@@ -3,7 +3,9 @@ import { test } from "node:test";
 import {
   buildAttachment,
   buildGenerationInput,
+  type HandoffConfig,
   handoffPathFor,
+  mergeHandoffConfig,
   parseAutoForce,
   parseHandoffRequest,
   promptFromFile,
@@ -53,6 +55,30 @@ test("promptFile resolves ~ and relative paths", () => {
   assert.equal(resolvePromptFile("~/a.md", "/cwd", "/home/u"), "/home/u/a.md");
   assert.equal(resolvePromptFile("x/a.md", "/cwd", "/home/u"), "/cwd/x/a.md");
   assert.equal(resolvePromptFile("/abs.md", "/cwd", "/home/u"), "/abs.md");
+});
+
+test("each config layer resolves its relative promptFile against its own base", () => {
+  const bases = { agentDir: "/agent", cwd: "/proj", home: "/home/u" };
+  assert.equal(
+    mergeHandoffConfig({ promptFile: "docs/p.md" }, {}, bases).promptFile,
+    "/agent/docs/p.md",
+  );
+  assert.equal(
+    mergeHandoffConfig({}, { promptFile: "docs/p.md" }, bases).promptFile,
+    "/proj/docs/p.md",
+  );
+  assert.equal(
+    mergeHandoffConfig({ promptFile: "g.md" }, { promptFile: "p.md" }, bases).promptFile,
+    "/proj/p.md",
+  );
+  assert.equal(
+    mergeHandoffConfig(
+      { promptFile: "g.md" },
+      { promptFile: null } as HandoffConfig,
+      bases,
+    ).promptFile,
+    null,
+  );
 });
 
 test("generation input carries the focus note and, when a goal is active, the goal line", () => {

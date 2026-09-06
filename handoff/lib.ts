@@ -173,7 +173,8 @@ export function promptFromFile(text: string): string {
 }
 
 export interface HandoffConfig {
-  /** Prompt file, absolute, `~`-prefixed, or relative to the project cwd. */
+  /** Prompt file, absolute, `~`-prefixed, or relative to the config's own base:
+   * the agent dir for the global config, the project cwd for `.pi/handoff.json`. */
   promptFile?: string;
   /** Default automatic handoff for every conversation. */
   auto?: AutoConfig;
@@ -181,9 +182,26 @@ export interface HandoffConfig {
 
 export function resolvePromptFile(
   promptFile: string,
-  cwd: string,
+  base: string,
   home: string,
 ): string {
   if (promptFile.startsWith("~/")) return path.join(home, promptFile.slice(2));
-  return path.resolve(cwd, promptFile);
+  return path.resolve(base, promptFile);
+}
+
+/** Project layer over global layer, each layer's promptFile made absolute
+ * against its own base before the merge picks a winner. */
+export function mergeHandoffConfig(
+  global: HandoffConfig,
+  project: HandoffConfig,
+  bases: { agentDir: string; cwd: string; home: string },
+): HandoffConfig {
+  const resolved = (layer: HandoffConfig, base: string): HandoffConfig =>
+    !layer.promptFile
+      ? layer
+      : { ...layer, promptFile: resolvePromptFile(layer.promptFile, base, bases.home) };
+  return {
+    ...resolved(global, bases.agentDir),
+    ...resolved(project, bases.cwd),
+  };
 }

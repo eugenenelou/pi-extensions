@@ -295,7 +295,7 @@ A `tool_call` handler covers what the bash jail cannot:
   stripped before matching, so a wrapper prefix cannot hide what runs.
 - **`.env` writes.** The `write` and `edit` tools refuse a path whose basename
   starts with `.env`. Reads are not guarded.
-- **Sandbox paths.** `read`/`write`/`edit`/`grep`/`find`/`ls` are answered from
+- **Sandbox paths.** Any tool call carrying a `path` is answered from
   the very config the jail was built with: a write outside `allowWrite` or
   inside `denyWrite`, and a read under a `denyRead` entry that no `allowRead`
   or `allowWrite` entry exposes. Everything the jail leaves visible stays
@@ -445,10 +445,11 @@ The generation prompt is built in, but a skill or markdown file can replace it:
 
 ```json
 // ~/.pi/agent/extensions/handoff.json (global) or <cwd>/.pi/handoff.json (project, wins)
-{ "promptFile": ".code_assistant/skills/eugene/loop-handoff/SKILL.md" }
+{ "promptFile": "docs/handoff-prompt.md" }
 ```
 
-The path is absolute, `~`-prefixed, or relative to the project cwd, so one
+The path is absolute, `~`-prefixed, or relative to the config's own base — the
+agent dir for the global config, the project cwd for `.pi/handoff.json` — so one
 global setting follows every worktree. YAML frontmatter is dropped and the
 extension's own contract is appended (the focus note is about content, output
 the markdown only). An unreadable file warns and falls back to the built-in

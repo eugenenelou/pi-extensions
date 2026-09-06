@@ -39,10 +39,10 @@ import {
   type HandoffConfig,
   type HandoffRequest,
   handoffPathFor,
+  mergeHandoffConfig,
   parseAutoForce,
   parseHandoffRequest,
   promptFromFile,
-  resolvePromptFile,
 } from "./lib.ts";
 import { HandoffMachine, headlessHost, type Host } from "./machine.ts";
 
@@ -58,17 +58,18 @@ function readJson(file: string): HandoffConfig {
 
 /** Global `~/.pi/agent/extensions/handoff.json` under project `.pi/handoff.json`. */
 function loadConfig(cwd: string): HandoffConfig {
-  return {
-    ...readJson(path.join(getAgentDir(), "extensions", "handoff.json")),
-    ...readJson(path.join(cwd, CONFIG_DIR_NAME, "handoff.json")),
-  };
+  const agentDir = getAgentDir();
+  return mergeHandoffConfig(
+    readJson(path.join(agentDir, "extensions", "handoff.json")),
+    readJson(path.join(cwd, CONFIG_DIR_NAME, "handoff.json")),
+    { agentDir, cwd, home: os.homedir() },
+  );
 }
 
 /** The configured prompt file, or the built-in prompt when none is set or readable. */
 function systemPrompt(ctx: ExtensionContext): string {
-  const { promptFile } = loadConfig(ctx.cwd);
-  if (!promptFile) return HANDOFF_SYSTEM_PROMPT;
-  const file = resolvePromptFile(promptFile, ctx.cwd, os.homedir());
+  const { promptFile: file } = loadConfig(ctx.cwd);
+  if (!file) return HANDOFF_SYSTEM_PROMPT;
   try {
     return promptFromFile(fs.readFileSync(file, "utf-8"));
   } catch (err) {
