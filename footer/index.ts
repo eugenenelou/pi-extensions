@@ -118,7 +118,7 @@ function applyCustomFooter(ctx: ExtensionContext): void {
         "warning",
       );
       queueMicrotask(() => ctx.ui.setFooter(undefined));
-      return { render: () => [] };
+      return { render: () => [], invalidate: () => {} };
     }
   });
 }

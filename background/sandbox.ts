@@ -10,7 +10,7 @@
 
 export type SandboxWrap = (command: string) => Promise<string>;
 
-type Globals = {
+export type Globals = {
   __codassSandbox?: { active: boolean; reason?: string };
   __codassSandboxWrap?: SandboxWrap;
 };

@@ -12,7 +12,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { BackgroundRunner, type TaskView } from "./machine.ts";
 import { createNodeHost } from "./host.ts";
-import { resolveWrap, type SandboxWrap } from "./sandbox.ts";
+import { resolveWrap, type Globals, type SandboxWrap } from "./sandbox.ts";
 
 const RunParams = Type.Object({
   command: Type.String({ description: "Shell command to run in the background" }),
@@ -40,7 +40,7 @@ function publishTasks(list: CodassBackgroundTasks | undefined): void {
 }
 
 function text(body: string) {
-  return { content: [{ type: "text" as const, text: body }] };
+  return { content: [{ type: "text" as const, text: body }], details: undefined };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -54,7 +54,7 @@ export default function (pi: ExtensionAPI) {
   // Resolved per command, never once per session: extensions load in an
   // arbitrary order, so the sandbox may publish its wrap after this one starts.
   const sandboxedWrap: SandboxWrap = async (command) => {
-    const resolved = resolveWrap(globalThis);
+    const resolved = resolveWrap(globalThis as Globals);
     if ("refusal" in resolved) throw new Error(resolved.refusal);
     return resolved.wrap(command);
   };
@@ -87,7 +87,7 @@ export default function (pi: ExtensionAPI) {
       "Start a shell command in the background, sandboxed exactly as the bash tool is. Returns at once with a task id and the path of the log the command's output is appended to; read or grep that log yourself. Use background_wait to wait for the command to end or for a marker to appear in its log, and background_kill to stop it.",
     parameters: RunParams,
     async execute(_id, params) {
-      const resolved = resolveWrap(globalThis);
+      const resolved = resolveWrap(globalThis as Globals);
       if ("refusal" in resolved) return text(resolved.refusal);
       const task = activeRunner().run(params.command);
       return text(`Started ${task.id}. Log: ${task.logPath}`);
@@ -138,7 +138,7 @@ export default function (pi: ExtensionAPI) {
     description: "List the running background tasks",
     handler: async (_args, ctx) => {
       const running = runner?.running() ?? [];
-      const resolved = resolveWrap(globalThis);
+      const resolved = resolveWrap(globalThis as Globals);
       ctx.ui.notify(
         running.length === 0
           ? ("refusal" in resolved

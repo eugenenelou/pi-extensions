@@ -74,7 +74,7 @@ test("each config layer resolves its relative promptFile against its own base", 
   assert.equal(
     mergeHandoffConfig(
       { promptFile: "g.md" },
-      { promptFile: null } as HandoffConfig,
+      { promptFile: null } as unknown as HandoffConfig,
       bases,
     ).promptFile,
     null,

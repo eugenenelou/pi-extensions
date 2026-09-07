@@ -79,14 +79,10 @@ function isSetting(data: unknown): data is AutoSetting {
 
 /** The last auto setting recorded in a session's entries, if any. */
 export function settingFromEntries(
-  entries: readonly { type: string }[],
+  entries: readonly { type: string; customType?: string; data?: unknown }[],
 ): AutoSetting | undefined {
   for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i] as {
-      type: string;
-      customType?: string;
-      data?: unknown;
-    };
+    const entry = entries[i];
     if (entry.type !== "custom" || entry.customType !== AUTO_ENTRY_TYPE)
       continue;
     return isSetting(entry.data) ? entry.data : undefined;

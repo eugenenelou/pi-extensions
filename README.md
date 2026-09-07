@@ -17,9 +17,16 @@ from a generated `.pi/settings.json`:
 }
 ```
 
-`subagents/` and `sandbox/` carry their own `package.json` + `node_modules`;
-run `npm install` in each after cloning. `footer/` has no dependencies of its
-own. `shared/` is not an extension: it holds code more than one of them uses.
+`subagents/` and `sandbox/` carry their own `package.json`; they are pnpm
+workspace packages, so one `pnpm install` at the root covers them and the root
+itself. `footer/` has no dependencies of its own. `shared/` is not an
+extension: it holds code more than one of them uses.
+
+`pnpm check` typechecks every extension against pi's own declarations. pi loads
+these files by stripping their types without checking them, so nothing else
+compares what an extension calls against what pi exports: run it after touching
+an extension, and after every pi version bump, where a renamed API surfaces as
+a silent runtime failure.
 
 ## Config files
 

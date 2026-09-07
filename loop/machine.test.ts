@@ -116,7 +116,7 @@ test("the run count crosses max_iters into exactly one handoff", () => {
   machine.agentEnd();
   machine.agentEnd();
   assert.equal(state.iterations, 2);
-  assert.deepEqual(handoffs, []);
+  assert.equal(handoffs.length, 0);
 
   machine.agentEnd();
   assert.equal(handoffs.length, 1);

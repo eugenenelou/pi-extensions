@@ -25,14 +25,10 @@ function isEntry(data: unknown): data is GoalEntry {
 
 /** The last goal recorded in a session's entries, or undefined when none is active. */
 export function goalFromEntries(
-  entries: readonly { type: string }[],
+  entries: readonly { type: string; customType?: string; data?: unknown }[],
 ): GoalEntry | undefined {
   for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i] as {
-      type: string;
-      customType?: string;
-      data?: unknown;
-    };
+    const entry = entries[i];
     if (entry.type !== "custom" || entry.customType !== GOAL_ENTRY_TYPE)
       continue;
     if (!isEntry(entry.data) || entry.data.condition === null) return undefined;
