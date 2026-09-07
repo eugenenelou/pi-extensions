@@ -8,6 +8,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type ConfigBases, configPath } from "./config.ts";
 import { judgeModel } from "./judge.ts";
@@ -32,15 +33,15 @@ function deploy(files: { global?: unknown; project?: unknown }): ConfigBases {
 
 const sessionModel = { id: "session" };
 
+// Typed against the real registry, so a method pi renames fails here rather
+// than only in production: a hand-written mock would keep passing.
+const modelRegistry: Pick<ExtensionContext["modelRegistry"], "find"> = {
+  find: (provider, model) =>
+    ({ id: `${provider}/${model}` }) as unknown as Model<Api>,
+};
+
 const context = () =>
-  ({
-    model: sessionModel,
-    modelRegistry: {
-      getModel: (provider: string, model: string) => ({
-        id: `${provider}/${model}`,
-      }),
-    },
-  }) as unknown as ExtensionContext;
+  ({ model: sessionModel, modelRegistry }) as unknown as ExtensionContext;
 
 test("the project judge.json overrides the agent-dir one", () => {
   const bases = deploy({

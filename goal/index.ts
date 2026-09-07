@@ -79,7 +79,7 @@ async function judge(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), JUDGE_TIMEOUT_MS);
   try {
-    const response = await ctx.modelRegistry.completeSimple(
+    const response = await ctx.modelRegistry.complete(
       model,
       {
         systemPrompt: JUDGE_SYSTEM_PROMPT,

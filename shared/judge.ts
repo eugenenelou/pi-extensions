@@ -21,7 +21,7 @@ export function judgeModel(
   const setting = mergedConfig<JudgeSetting>("judge.json", bases);
   const model =
     setting.provider && setting.model
-      ? ctx.modelRegistry.getModel(setting.provider, setting.model)
+      ? ctx.modelRegistry.find(setting.provider, setting.model)
       : undefined;
   return { model: model ?? ctx.model, thinking: setting.thinking };
 }

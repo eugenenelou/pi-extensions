@@ -655,7 +655,7 @@ async function askJudge(
   const { model, thinking } = judgeModel(ctx, configBases(ctx.cwd));
   if (!model) return { verdict: "ask", reason: "no judge model configured" };
   try {
-    const response = await ctx.modelRegistry.completeSimple(
+    const response = await ctx.modelRegistry.complete(
       model,
       {
         systemPrompt: JUDGE_SYSTEM_PROMPT,
