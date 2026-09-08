@@ -448,6 +448,12 @@ new session as its first entry, a displayed custom message, so everything that
 follows runs against it. The focus note steers what the handoff covers; it
 is not a task for the new session.
 
+`/handoff-file [focus note]` uses the same branch, configured prompt, model,
+and `<session>.handoff.md` path, overwriting that file without switching
+sessions or adding anything to the conversation. It works without a TUI, does
+not capture or replay input, and treats `auto …` as an ordinary focus note.
+Either handoff command cancels a handoff already in progress.
+
 The command returns at once and does its work in the background: pi's input
 loop waits for a command handler, and inputs typed meanwhile would be held
 back from extensions. A status line above the editor shows progress. Inputs typed while the

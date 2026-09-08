@@ -143,6 +143,80 @@ test("idle: writes the file, attaches the handoff first, replays captured inputs
   assert.equal(f.widget, undefined);
 });
 
+test("file-only: writes the handoff without switching, attaching, replaying, or capturing input", async () => {
+  const f = fakeHost();
+  const m = new HandoffMachine();
+  const done = m.file(f.host, "keep the migration details");
+
+  assert.equal(m.phase, "writing");
+  assert.equal(m.onInput("leave this in the current session", undefined), false);
+  f.finishHandoff("## Next\nrun migrations\n");
+  await done;
+
+  assert.equal(
+    f.log.find((line) => line.startsWith("write:")),
+    "write:/s/x.handoff.md:## Next\nrun migrations\n",
+  );
+  assert.equal(f.log.includes("newSession"), false);
+  assert.deepEqual(f.next.appended, []);
+  assert.deepEqual(f.next.sent, []);
+  assert.equal(m.phase, "idle");
+  assert.equal(f.widget, undefined);
+  assert.ok(
+    f.log.includes("notify:Handoff file written (/s/x.handoff.md)"),
+  );
+});
+
+test("/handoff-file cancels an in-progress /handoff", async () => {
+  const f = fakeHost();
+  const m = new HandoffMachine();
+  const done = m.command(f.host, "");
+  m.onInput("queued", undefined);
+
+  await m.file(f.host, "");
+  assert.equal(f.signal?.aborted, true);
+  assert.equal(f.editor, "queued");
+  assert.equal(m.phase, "idle");
+  assert.equal(f.widget, undefined);
+  f.finishHandoff(null);
+  await done;
+});
+
+test("/handoff cancels an in-progress /handoff-file", async () => {
+  const f = fakeHost();
+  const m = new HandoffMachine();
+  const done = m.file(f.host, "");
+
+  await m.command(f.host, "");
+  assert.equal(f.signal?.aborted, true);
+  assert.equal(m.phase, "idle");
+  assert.equal(f.widget, undefined);
+  f.finishHandoff(null);
+  await done;
+  assert.equal(f.log.includes("newSession"), false);
+});
+
+test("a cancelled generation cannot affect a replacement handoff run", async () => {
+  const first = fakeHost();
+  const second = fakeHost();
+  const m = new HandoffMachine();
+  const firstDone = m.command(first.host, "first");
+
+  await m.command(first.host, "");
+  const secondDone = m.request(second.host, "second");
+  first.finishHandoff("## Next\nold run\n");
+  await firstDone;
+
+  assert.equal(m.phase, "writing");
+  assert.equal(first.log.some((line) => line.startsWith("write:")), false);
+  assert.equal(first.log.includes("newSession"), false);
+
+  second.finishHandoff("## Next\nnew run\n");
+  await secondDone;
+  assert.ok(second.log.includes("write:/s/x.handoff.md:## Next\nnew run\n"));
+  assert.ok(second.log.includes("newSession"));
+});
+
 test("a seeded resume directive is sent after the baton, ahead of replayed input", async () => {
   const f = fakeHost({ resume: "Continue the goal" });
   const m = new HandoffMachine();

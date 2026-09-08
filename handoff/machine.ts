@@ -11,6 +11,7 @@ import {
 } from "./lib.ts";
 
 export type Phase = "idle" | "armed" | "writing" | "switching";
+type RunMode = "session" | "file";
 
 /** What the new session must accept from the machine. */
 export interface NextSession {
@@ -79,15 +80,19 @@ export function headlessHost(host: Host, batonPath?: string): Host {
 }
 
 const CANCELLED = "Handoff cancelled; queued inputs restored to the editor";
+const FILE_CANCELLED = "Handoff file cancelled";
 
 export class HandoffMachine {
   phase: Phase = "idle";
   stash: string[] = [];
   private abort: AbortController | undefined;
+  private nextRun = 0;
+  private activeRun = 0;
   /** The host of the run in progress; every effect of that run goes through it. */
   private host: Host | undefined;
   /** A run started off the bus is invisible, so it must not steal typed inputs. */
   private capturing = true;
+  private mode: RunMode = "session";
 
   /** Extension `input` handler: true when the input was captured for the new session. */
   onInput(
@@ -101,7 +106,9 @@ export class HandoffMachine {
       (this.phase === "armed" && streamingBehavior === "followUp");
     if (!capture) return false;
     this.stash.push(text);
-    if (this.host) this.host.setWidget(widgetLines(this.stash, this.phase));
+    if (this.host) {
+      this.host.setWidget(widgetLines(this.stash, this.phase, this.mode === "file"));
+    }
     return true;
   }
 
@@ -109,23 +116,35 @@ export class HandoffMachine {
   onSessionShutdown(): void {
     if (this.phase === "switching") return;
     this.phase = "idle";
+    this.activeRun = 0;
     this.host = undefined;
+    this.capturing = true;
+    this.mode = "session";
     this.stash = [];
   }
 
   /** `/handoff` typed: starts a run, or cancels the one in progress. Returns at once. */
   command(host: Host, focus: string, goalActive = false): Promise<void> {
     if (this.phase !== "idle") {
-      this.cancel(CANCELLED);
+      this.cancel(this.mode === "file" ? FILE_CANCELLED : CANCELLED);
       return Promise.resolve();
     }
-    return this.start(host, focus, goalActive, true);
+    return this.start(host, focus, goalActive, true, "session");
+  }
+
+  /** `/handoff-file` typed: writes only, or cancels the one in progress. */
+  file(host: Host, focus: string): Promise<void> {
+    if (this.phase !== "idle") {
+      this.cancel(this.mode === "file" ? FILE_CANCELLED : CANCELLED);
+      return Promise.resolve();
+    }
+    return this.start(host, focus, false, false, "file");
   }
 
   /** Bus entry point: starts a run, and does nothing while one is in progress. */
   request(host: Host, focus: string, goalActive = false): Promise<void> {
     if (this.phase !== "idle") return Promise.resolve();
-    return this.start(host, focus, goalActive, false);
+    return this.start(host, focus, goalActive, false, "session");
   }
 
   private start(
@@ -133,17 +152,25 @@ export class HandoffMachine {
     focus: string,
     goalActive: boolean,
     capturing: boolean,
+    mode: RunMode,
   ): Promise<void> {
+    const run = ++this.nextRun;
+    this.activeRun = run;
     this.host = host;
     this.capturing = capturing;
-    return this.run(host, focus, goalActive).catch((err) => {
-      this.cancel(`Handoff failed: ${(err as Error).message ?? err}`);
+    this.mode = mode;
+    return this.run(host, focus, goalActive, run).catch((err) => {
+      if (this.activeRun === run) {
+        this.cancel(`Handoff failed: ${(err as Error).message ?? err}`);
+      }
     });
   }
 
   private setPhase(host: Host, next: Phase): void {
     this.phase = next;
-    host.setWidget(next === "idle" ? undefined : widgetLines(this.stash, next));
+    host.setWidget(
+      next === "idle" ? undefined : widgetLines(this.stash, next, this.mode === "file"),
+    );
   }
 
 
@@ -153,7 +180,10 @@ export class HandoffMachine {
     this.abort?.abort();
     this.abort = undefined;
     this.phase = "idle";
+    this.activeRun = 0;
     this.host = undefined;
+    this.capturing = true;
+    this.mode = "session";
     if (host) {
       host.setWidget(undefined);
       if (this.stash.length > 0) {
@@ -168,16 +198,19 @@ export class HandoffMachine {
     host: Host,
     focus: string,
     goalActive: boolean,
+    run: number,
   ): Promise<void> {
     this.stash = [];
     if (!host.isIdle()) {
       this.setPhase(host, "armed");
       host.notify(
-        "Handoff armed: runs when the agent settles; Alt+Enter inputs go to the new session",
+        this.mode === "file"
+          ? "Handoff file armed: runs when the agent settles"
+          : "Handoff armed: runs when the agent settles; Alt+Enter inputs go to the new session",
         "info",
       );
       await host.waitForIdle();
-      if (this.phase !== "armed") return;
+      if (this.activeRun !== run || this.phase !== "armed") return;
     }
     this.setPhase(host, "writing");
 
@@ -195,26 +228,40 @@ export class HandoffMachine {
         this.abort.signal,
       );
     } catch (err) {
-      this.cancel(`Handoff generation failed: ${(err as Error).message ?? err}`);
+      if (this.activeRun === run) {
+        this.cancel(`Handoff generation failed: ${(err as Error).message ?? err}`);
+      }
       return;
     }
-    if (this.phase !== "writing") return;
+    if (this.activeRun !== run || this.phase !== "writing") return;
     if (handoff === null) {
-      this.cancel(CANCELLED);
+      this.cancel(this.mode === "file" ? FILE_CANCELLED : CANCELLED);
       return;
     }
     this.abort = undefined;
 
     const handoffPath = host.handoffPath();
     host.writeFile(handoffPath, `${handoff.trim()}\n`);
+    if (this.mode === "file") {
+      this.setPhase(host, "idle");
+      this.activeRun = 0;
+      this.host = undefined;
+      this.capturing = true;
+      this.mode = "session";
+      this.stash = [];
+      host.notify(`Handoff file written (${handoffPath})`, "info");
+      return;
+    }
 
     this.setPhase(host, "switching");
     const result = await host.newSession(async (next) => {
+      if (this.activeRun !== run || this.phase !== "switching") return;
       next.appendMessage(buildAttachment(handoff));
       const resume = host.resumeMessage();
       const toReplay = resume ? [resume, ...this.stash] : this.stash;
       this.stash = [];
       this.phase = "idle";
+      this.activeRun = 0;
       this.host = undefined;
       next.clearWidget();
       if (toReplay.length === 0) {
@@ -235,7 +282,7 @@ export class HandoffMachine {
         );
       });
     });
-    if (result.cancelled) {
+    if (result.cancelled && this.activeRun === run) {
       this.cancel("New session cancelled; queued inputs restored to the editor");
     }
   }

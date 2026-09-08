@@ -1,6 +1,7 @@
 /**
  * /handoff [focus note]: write a forward-looking handoff beside the session
- * transcript and continue in a new session with it in context.
+ * transcript and continue in a new session with it in context. `/handoff-file`
+ * writes the same handoff without leaving the current session.
  *
  * The behaviour lives in `machine.ts`; this file builds its host from pi's
  * extension context. Typed while the agent is running, the command arms and
@@ -315,6 +316,23 @@ export default function (pi: ExtensionAPI) {
             request.goalActive,
           )
         : machine.command(host, args.trim()));
+    },
+  });
+
+  pi.registerCommand("handoff-file", {
+    description: "Write a handoff file without starting a new session [focus note]",
+    handler: async (args, ctx) => {
+      if (!ctx.model) {
+        ctx.ui.notify("No model selected", "error");
+        return;
+      }
+      // Unlike /handoff, every argument is a focus note: `auto` has no
+      // special meaning, and this mode works without a terminal.
+      const host = hostFor(ctx, auto.setting(), auto.hold());
+      void machine.file(
+        ctx.mode === "tui" ? host : headlessHost(host),
+        args.trim(),
+      );
     },
   });
 }

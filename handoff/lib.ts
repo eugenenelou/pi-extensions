@@ -154,7 +154,16 @@ export function restoreEditorText(stash: string[], current: string): string {
 export function widgetLines(
   stash: string[],
   phase: "armed" | "writing" | "switching" | "idle",
+  fileOnly = false,
 ): string[] {
+  if (fileOnly) {
+    return [
+      phase === "armed"
+        ? "Handoff file: armed, runs when the agent settles"
+        : "Handoff file: writing…",
+      "↳ /handoff-file again to cancel",
+    ];
+  }
   const status =
     phase === "armed"
       ? "Handoff: armed, runs when the agent settles; Alt+Enter inputs go to the new session"
