@@ -70,10 +70,10 @@ searched; there is no `agentScope` parameter.
 ```yaml
 name: builder
 description: one line
-tools: read, write, edit, bash, grep, find, ls, subagent   # comma-separated pi tool names; absent = all tools
-model: openai-codex/gpt-5.6-terra                          # provider/id
-thinking: high                                             # off|minimal|low|medium|high|xhigh|max
-mcpServers:                                                # optional, Claude .mcp.json server shape, already resolved (no ${VAR})
+tools: read, write, edit, bash, grep, find, ls, subagent # comma-separated pi tool names; absent = all tools
+model: openai-codex/gpt-5.6-terra # provider/id
+thinking: high # off|minimal|low|medium|high|xhigh|max
+mcpServers: # optional, Claude .mcp.json server shape, already resolved (no ${VAR})
   linear:
     command: uv
     args: [...]
@@ -138,7 +138,7 @@ the servers arrive as a config layer rather than a runtime registration, the
 child gets them with their `directTools` honoured — a `directTools: true`
 server is called as one direct tool instead of through the `mcp` proxy.
 
-The file replaces the adapter's *global* layer (`~/.pi/agent/mcp.json`) and
+The file replaces the adapter's _global_ layer (`~/.pi/agent/mcp.json`) and
 merges with everything else, project layers last, so a name that also exists in
 `.mcp.json` or `.pi/mcp.json` resolves to the project's definition. Do not set
 `PI_MCP_CONFIG_MODE=exclusive`: it makes the adapter ignore the flag entirely
@@ -179,13 +179,13 @@ survives.
 `FooterComponent` takes pi's internal `AgentSession`, which extensions cannot
 reach. A shim exposes exactly the members it reads:
 
-| member | source |
-| --- | --- |
-| `state.model` | `ctx.model` |
-| `state.thinkingLevel` | `ctx.thinkingLevel` |
-| `sessionManager` (`getEntries`, `getCwd`, `getSessionName`) | `ctx.sessionManager` |
-| `getContextUsage()` | `ctx.getContextUsage()` |
-| `modelRuntime.isUsingSubscription(provider)` | constant `false` — no public source |
+| member                                                      | source                              |
+| ----------------------------------------------------------- | ----------------------------------- |
+| `state.model`                                               | `ctx.model`                         |
+| `state.thinkingLevel`                                       | `ctx.thinkingLevel`                 |
+| `sessionManager` (`getEntries`, `getCwd`, `getSessionName`) | `ctx.sessionManager`                |
+| `getContextUsage()`                                         | `ctx.getContextUsage()`             |
+| `modelRuntime.isUsingSubscription(provider)`                | constant `false` — no public source |
 
 The constant is the one visible difference: a subscription-backed provider with
 no accrued cost shows no ` (sub)` marker. `state` is a getter, so a model or
@@ -240,14 +240,14 @@ Four deliberate changes to the upstream file:
 `@anthropic-ai/sandbox-runtime` is deny-by-default for the network, and the
 only "unrestricted" setting is no network config at all:
 
-| `network` in config | effect |
-| --- | --- |
-| absent / `{}` | no network restriction; the sandbox keeps the host network namespace |
-| `allowedDomains: []` | all network denied |
-| `allowedDomains: [...]` | only those domains, through the runtime's HTTP/SOCKS proxies |
+| `network` in config     | effect                                                               |
+| ----------------------- | -------------------------------------------------------------------- |
+| absent / `{}`           | no network restriction; the sandbox keeps the host network namespace |
+| `allowedDomains: []`    | all network denied                                                   |
+| `allowedDomains: [...]` | only those domains, through the runtime's HTTP/SOCKS proxies         |
 
-socat is only *used* by the proxy bridge, i.e. only when a domain allowlist is
-set. It is nevertheless *checked for* unconditionally on Linux:
+socat is only _used_ by the proxy bridge, i.e. only when a domain allowlist is
+set. It is nevertheless _checked for_ unconditionally on Linux:
 `SandboxManager.initialize()` calls `checkDependencies()`, which requires
 `bwrap`, `rg` **and** `socat`, and `initialize()` also starts the socat bridge
 before it knows whether any domain filtering is needed. On a host without socat
@@ -261,7 +261,7 @@ domain filtering.
 
 The runtime binds `/dev/null` over a fixed set of dangerous paths (`.git/config`,
 `.claude/commands`, `.claude/agents`, `.vscode`, `.idea`, `.bashrc`, `.env`, …).
-bwrap materialises a missing target as a read-only empty *file*, so in any
+bwrap materialises a missing target as a read-only empty _file_, so in any
 directory lacking some of those names the first run left 0-byte placeholders
 behind — and a placeholder `.git` then broke every later run with `bwrap: Can't
 mkdir parents for .../.git/hooks: Not a directory`.
@@ -299,6 +299,25 @@ each existing `allowRead` path read-only right after it (parents before
 children), and leaves the runtime's write binds and deny binds behind them,
 where they still win.
 
+The runtime's own launch files get the same treatment: its script runs
+`apply-seccomp <filter>` inside the jail before the user command, and both files
+live wherever `@anthropic-ai/sandbox-runtime` is installed — under home, for a
+checkout like this one. `bootstrapAssets()` reads their paths off the generated
+command and binds them read-only next to the `allowRead` paths. They are the
+only files re-exposed without being in a policy; a `denyRead` that names their
+directory still wins.
+
+At `session_start`, `verifySandboxBootstrap()` runs one `true` through the
+jail exactly as bash will. If it fails, the sandbox is refused — bash stays
+blocked, never unconfined — and the notification names the launch file that is
+missing on the machine or the `denyRead` entry hiding it.
+
+A git worktree's `.git` is a pointer file, not a directory; a missing
+protected path whose nearest existing ancestor is that file gets it frozen
+read-only onto itself instead of masked with `/dev/null`, so git can still
+read it. The main checkout's `.git` must be in `allowWrite` for git commands
+to work from inside a worktree.
+
 The home directory itself is a writable tmpfs inside the jail: a command can
 create `~/probe.txt`, but it lands in an empty overlay that disappears with the
 command, not in the real home.
@@ -309,8 +328,8 @@ The `allowRead`/`allowWrite` lists codass writes are per-machine, from
 ```yaml
 pi:
   sandbox:
-    allow_read: [...]   # replaces codass' default list
-    allow_write: [...]  # replaces codass' default list (worktree and /tmp stay)
+    allow_read: [...] # replaces codass' default list
+    allow_write: [...] # replaces codass' default list (worktree and /tmp stay)
 ```
 
 ### Guards
@@ -325,11 +344,16 @@ A `tool_call` handler covers what the bash jail cannot:
 - **Sandbox paths.** Any tool call carrying a `path` is answered from
   the very config the jail was built with: a write outside `allowWrite` or
   inside `denyWrite`, and a read under a `denyRead` entry that no `allowRead`
-  or `allowWrite` entry exposes. Everything the jail leaves visible stays
-  readable. A disabled sandbox has no policy, so this guard is off with it.
+  or folder grant exposes. On Linux, `allowWrite` only reopens reads through
+  the home-directory overlay; other read denies remain hidden. Everything the
+  jail leaves visible stays readable. A disabled sandbox has no policy, so
+  this guard is off with it.
 
-Each is a prompt, not a hard block: with a UI the user picks `Block` or
-`Allow once`; without one (`--print`, `--mode json`) it blocks.
+Command and `.env` guards prompt: with a UI the user picks `Block` or
+`Allow once`; without one (`--print`, `--mode json`) they block. Sandbox-path
+policy denials always block — a command approval cannot grant filesystem
+access. Folder access is supplied as a policy grant, rather than by this
+command-approval prompt.
 
 ### Bash gate
 
@@ -345,7 +369,7 @@ Both enforcement points append one JSON line per refusal to
 
 - sandbox: `{ts, cwd, command, line}` for each stderr line of a failed command
   matching `Read-only file system`, `Permission denied`, `No such file or
-  directory` or `Operation not permitted` (10 lines per command at most)
+directory` or `Operation not permitted` (10 lines per command at most)
 - guards: `{ts, cwd, tool, path, reason}` for each blocked file-tool call, and
   `{ts, cwd, tool, command, reason}` for a bash call the gate refused
 
@@ -365,7 +389,7 @@ globalThis.__codassSandbox = {
 };
 ```
 
-It is set from `session_start`, after the bash override is wired *and* the
+It is set from `session_start`, after the bash override is wired _and_ the
 sandbox is in force — never at import time. Every path that deliberately runs
 unsandboxed publishes `{ active: false, reason }` instead: `--no-sandbox`,
 `"enabled": false`, an unsupported platform, and a `SandboxManager.initialize()`
@@ -426,9 +450,11 @@ import, with everything that touches the outside world behind a host interface
 background/machine.test.ts`, `background/sandbox.test.ts`,
 `background/wrap.test.ts` (the last one spawns real processes), and
 `sandbox/background-wrap.test.ts`, which runs a background command through the
-real bwrap jail and expects a denied write to fail. That last one lives in
-`sandbox/` for its `node_modules`, and skips unless bwrap is installed and the
-pi package is resolvable from there.
+real bwrap jail and expects a denied write to stay off the host. Those last two
+live in `sandbox/` for its `node_modules`, and skip unless bwrap is installed
+and the pi package is resolvable from there. `sandbox/hidden-home-jail.test.ts`
+is the other real-jail probe: the codass policy (`denyRead: ["~/"]`, one
+worktree allowed) with the runtime's launch files under that hidden home.
 
 ## `handoff/`
 

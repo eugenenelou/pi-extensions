@@ -8,7 +8,10 @@
  * means bash is not really sandboxed, and the runner refuses.
  */
 
-export type SandboxWrap = (command: string) => Promise<string>;
+export type SandboxWrap = (
+  command: string,
+  executionId?: string,
+) => Promise<string>;
 
 export type Globals = {
   __codassSandbox?: { active: boolean; reason?: string };

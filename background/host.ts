@@ -64,6 +64,7 @@ export function createNodeHost(deps: {
       command: string,
       logPath: string,
       onExit: (status: ExitStatus) => void,
+      executionId?: string,
     ): ProcessHandle {
       let child: ReturnType<typeof spawn> | undefined;
       let killed = false;
@@ -81,7 +82,7 @@ export function createNodeHost(deps: {
       void (async () => {
         let wrapped: string;
         try {
-          wrapped = await deps.wrap(command);
+          wrapped = await deps.wrap(command, executionId);
         } catch (err) {
           appendFileSync(
             logPath,

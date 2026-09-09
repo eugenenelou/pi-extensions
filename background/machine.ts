@@ -29,6 +29,7 @@ export interface BackgroundHost {
     command: string,
     logPath: string,
     onExit: (status: ExitStatus) => void,
+    executionId?: string,
   ): ProcessHandle;
   /** Where the log of a task goes. */
   logPathFor(id: string): string;
@@ -73,7 +74,10 @@ export class BackgroundRunner {
     this.#host = host;
   }
 
-  run(command: string): { id: string; logPath: string } {
+  run(
+    command: string,
+    executionId?: string,
+  ): { id: string; logPath: string } {
     const id = `bg${++this.#counter}`;
     const logPath = this.#host.logPathFor(id);
     const task: Task = {
@@ -86,8 +90,11 @@ export class BackgroundRunner {
       handle: { kill: () => {} },
     };
     this.#tasks.set(id, task);
-    task.handle = this.#host.start(command, logPath, (status) =>
-      this.#settle(task, status),
+    task.handle = this.#host.start(
+      command,
+      logPath,
+      (status) => this.#settle(task, status),
+      executionId,
     );
     return { id, logPath };
   }

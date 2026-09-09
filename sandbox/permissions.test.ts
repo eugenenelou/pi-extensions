@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   CHOICES,
+  JUDGE_SYSTEM_PROMPT,
   PermissionMachine,
   type PermissionConfig,
   type PermissionHost,
@@ -54,6 +55,11 @@ const CONFIG: PermissionConfig = {
 };
 
 const bash = (command: string): ToolCall => ({ toolName: "bash", command });
+
+test("the command judge never treats an outside-project folder as a command risk", () => {
+  assert.match(JUDGE_SYSTEM_PROMPT, /never by this verdict/);
+  assert.doesNotMatch(JUDGE_SYSTEM_PROMPT, /outside the project/);
+});
 
 test("deny beats allow, and never reaches the judge", async () => {
   const f = fakeHost({ verdict: { verdict: "allow" } });

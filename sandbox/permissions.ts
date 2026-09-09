@@ -71,10 +71,12 @@ export const JUDGE_SYSTEM_PROMPT = `You decide whether a coding agent may run a 
 Answer with one JSON object and nothing else:
 {"verdict": "allow" | "deny" | "ask", "reason": "<one short sentence>"}
 
-allow: routine, reversible work on the project the agent is already editing.
-deny: destructive, irreversible, or clearly outside the project — data loss,
-  credentials, publishing, or reaching machines the task never mentioned.
-ask: anything a careful engineer would want to see before it runs.
+allow: routine, reversible work.
+deny: destructive, irreversible work — data loss, credentials, publishing, or
+  reaching machines the task never mentioned.
+ask: independent command risks a careful engineer would want to see before it runs.
+Filesystem locations, different project roots, and folders outside the working
+ directory are authorized by the filesystem sandbox, never by this verdict.
 When unsure, answer ask.`;
 
 /** Object keys sorted, so the same call renders to the same subject twice. */

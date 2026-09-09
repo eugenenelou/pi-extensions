@@ -50,12 +50,12 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  readlinkSync,
-  realpathSync,
+  readdirSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   SandboxManager,
   type SandboxRuntimeConfig,
@@ -82,6 +82,18 @@ import {
 import { judgeModel } from "../shared/judge.ts";
 import { capBashOutput } from "./bash-output.ts";
 import {
+  FilesystemPolicy,
+  expandFilesystemPath,
+  filesystemGlobToRegex,
+  hasFilesystemGlob,
+  isWithin,
+  mandatoryWriteProtectionRoots,
+  normalizeFilesystemPattern,
+  resolveFilesystemPath,
+  type FolderGrant,
+  type FilesystemPolicyConfig,
+} from "./filesystem-policy.ts";
+import {
   JUDGE_SYSTEM_PROMPT,
   PermissionMachine,
   type AllowRule,
@@ -94,15 +106,18 @@ import {
   subjectOf,
 } from "./permissions.ts";
 
-type FilesystemConfig = Partial<SandboxRuntimeConfig["filesystem"]> & {
-  /**
-   * Paths kept visible inside a `denyRead` subtree. The runtime has no such
-   * key: it is applied here by reordering the bwrap argv (see
-   * `applyAllowRead`), so `denyRead: ["~/"]` can hide the whole home directory
-   * while a handful of tool directories stay readable.
-   */
-  allowRead?: string[];
-};
+type FilesystemConfig = Partial<SandboxRuntimeConfig["filesystem"]> &
+  FilesystemPolicyConfig & {
+    /**
+     * Paths kept visible inside a `denyRead` subtree. The runtime has no such
+     * key: it is applied here by reordering the bwrap argv (see
+     * `applyAllowRead`), so `denyRead: ["~/"]` can hide the whole home directory
+     * while a handful of tool directories stay readable.
+     */
+    allowRead?: string[];
+    /** Configured grants are the test/configuration seam; no tool creates them. */
+    grants?: FolderGrant[];
+  };
 
 interface SandboxConfig extends Omit<
   SandboxRuntimeConfig,
@@ -125,6 +140,9 @@ const DEFAULT_CONFIG: SandboxConfig = {
   network: {},
   filesystem: {
     denyRead: ["~/.ssh", "~/.aws", "~/.gnupg"],
+    // These credential roots are explicit protections, not default hiding:
+    // folder grants may not reopen them or descendants.
+    protectedRead: ["~/.ssh", "~/.aws", "~/.gnupg"],
     allowWrite: [".", "/tmp"],
     denyWrite: [".env", ".env.*", "*.pem", "*.key"],
   },
@@ -186,17 +204,18 @@ function deepMerge(
  * `.idea`, …) is materialised as 0-byte litter in the working directory. Dropping
  * the binds whose target does not exist loses nothing: there is no file to hide.
  */
-function dropMissingDevNullBinds(command: string): string {
+export function dropMissingDevNullBinds(command: string): string {
   if (!command.startsWith("bwrap ")) return command;
 
-  const sep = command.search(/ -- (?!-)/);
+  const sep = shellArgumentSeparator(command);
   const argv = sep === -1 ? command : command.slice(0, sep);
   const rest = sep === -1 ? "" : command.slice(sep);
 
   const filtered = argv.replace(
-    /--(?:ro-)?bind \/dev\/null ((?:\\.|[^\s])+) ?/g,
+    /--(?:ro-)?bind \/dev\/null ((?:"(?:\\.|[^"])*"|'[^']*'|\\.|[^\s])+)(?: )?/g,
     (match, target: string) => {
-      const path = target.replace(/\\(.)/g, "$1");
+      const words = shellWords(target);
+      const path = words?.length === 1 ? words[0] : target;
       return existsSync(path) ? match : "";
     },
   );
@@ -208,9 +227,7 @@ const HOME = homedir();
 
 /** Absolute path for a config entry, expanding a leading `~`. */
 function expandPath(pathPattern: string, cwd: string = process.cwd()): string {
-  if (pathPattern === "~") return HOME;
-  if (pathPattern.startsWith("~/")) return join(HOME, pathPattern.slice(2));
-  return resolve(cwd, pathPattern);
+  return expandFilesystemPath(pathPattern, cwd);
 }
 
 function shellQuote(value: string): string {
@@ -224,14 +241,35 @@ function escapeRegExp(value: string): string {
 }
 
 /**
+ * The files the runtime's launch script executes inside the jail before the
+ * user command: the seccomp applier and the filter it loads. Read off the
+ * generated command, so wherever the installed runtime resolved them is what
+ * gets kept visible.
+ */
+export function bootstrapAssets(command: string): string[] {
+  const sep = shellArgumentSeparator(command);
+  if (sep === -1) return [];
+  const launch = shellWords(command.slice(sep + " -- ".length));
+  const script = launch?.[1] === "-c" ? launch[2] : undefined;
+  if (script === undefined) return [];
+  for (const line of script.split("\n")) {
+    const [applier, filter] = shellWords(line) ?? [];
+    if (applier && filter && basename(applier) === "apply-seccomp") {
+      return [applier, filter];
+    }
+  }
+  return [];
+}
+
+/**
  * Re-expose `filesystem.allowRead` paths inside a home directory hidden by
  * `denyRead`.
  *
  * bwrap applies mounts in argv order, and the runtime emits read denies last —
  * a `--tmpfs ~` would therefore bury the worktree bind that precedes it. The
- * tmpfs is moved to the front of the filesystem mounts, the allowRead paths are
- * bound read-only right after it, and every write bind and deny the runtime
- * produced keeps its place behind them.
+ * tmpfs is moved to the front of the filesystem mounts, the allowRead paths and
+ * the runtime's own launch files are bound read-only right after it, and every
+ * write bind and deny the runtime produced keeps its place behind them.
  */
 export function applyAllowRead(
   command: string,
@@ -239,7 +277,7 @@ export function applyAllowRead(
 ): string {
   if (!command.startsWith("bwrap ")) return command;
 
-  const sep = command.search(/ -- (?!-)/);
+  const sep = shellArgumentSeparator(command);
   const argv = sep === -1 ? command : command.slice(0, sep);
   const rest = sep === -1 ? "" : command.slice(sep);
 
@@ -255,10 +293,14 @@ export function applyAllowRead(
   ]
     .filter(existsSync)
     .sort((a, b) => a.length - b.length);
+  const bootstrap = bootstrapAssets(command).filter(
+    (path) =>
+      existsSync(path) && !allowRead.some((root) => isWithin(path, root)),
+  );
 
   const mounts = [
     `--tmpfs ${shellQuote(HOME)} `,
-    ...allowRead.map(
+    ...[...allowRead, ...bootstrap].map(
       (path) => `--ro-bind ${shellQuote(path)} ${shellQuote(path)} `,
     ),
   ].join("");
@@ -274,6 +316,311 @@ export function applyAllowRead(
     argv.slice(insertAt).replace(homeTmpfs, "");
 
   return rebuilt + rest;
+}
+
+/** Locate bwrap's standalone command separator without matching a quoted path. */
+function shellArgumentSeparator(command: string): number {
+  let quote: "'" | '"' | undefined;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (quote) {
+      if (char === quote) quote = undefined;
+      else if (char === "\\" && quote === '"') index += 1;
+      continue;
+    }
+    if (char === "'" || char === '"') quote = char;
+    else if (char === "\\") index += 1;
+    else if (char === " " && command.startsWith(" -- ", index)) return index;
+  }
+  return -1;
+}
+
+/** Decode the shell-quoted bwrap argv well enough to preserve its deny mounts. */
+function shellWords(command: string): string[] | undefined {
+  const words: string[] = [];
+  let word = "";
+  let quote: "'" | '"' | undefined;
+  let present = false;
+  for (let i = 0; i < command.length; i += 1) {
+    const char = command[i];
+    if (quote) {
+      if (char === quote) {
+        quote = undefined;
+      } else if (char === "\\" && quote === '"') {
+        word += command[++i] ?? "";
+      } else {
+        word += char;
+      }
+      present = true;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      present = true;
+    } else if (char === "\\") {
+      word += command[++i] ?? "";
+      present = true;
+    } else if (/\s/.test(char)) {
+      if (present) words.push(word);
+      word = "";
+      present = false;
+    } else {
+      word += char;
+      present = true;
+    }
+  }
+  if (quote) return undefined;
+  if (present) words.push(word);
+  return words;
+}
+
+/** The first nonexistent component is where a dev-null bind blocks creation. */
+const MANDATORY_NAMES = new Set([
+  ".gitconfig",
+  ".gitmodules",
+  ".bashrc",
+  ".bash_profile",
+  ".zshrc",
+  ".zprofile",
+  ".profile",
+  ".ripgreprc",
+  ".mcp.json",
+  ".git",
+  ".claude",
+  ".vscode",
+  ".idea",
+]);
+
+/** Match the runtime's bounded nested mandatory-protection discovery. */
+function mandatoryGrantProtections(
+  root: string,
+  allowGitConfig: boolean,
+): string[] {
+  const protectedRoots = new Set(
+    mandatoryWriteProtectionRoots(root, allowGitConfig),
+  );
+  const visit = (directory: string, depth: number) => {
+    if (depth >= 3) return;
+    try {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        if (entry.name === "node_modules") continue;
+        const path = join(directory, entry.name);
+        if (MANDATORY_NAMES.has(entry.name)) {
+          for (const protectedPath of mandatoryWriteProtectionRoots(
+            path,
+            allowGitConfig,
+          ))
+            protectedRoots.add(protectedPath);
+        }
+        if (entry.isDirectory()) visit(path, depth + 1);
+      }
+    } catch {
+      return;
+    }
+  };
+  visit(root, 0);
+  return [...protectedRoots];
+}
+
+function firstMissingComponent(path: string): string {
+  let current = path;
+  const missing: string[] = [];
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) return path;
+    missing.unshift(basename(current));
+    current = parent;
+  }
+  // bwrap may have materialized an earlier missing ancestor as a file. A
+  // descendant bind below that file is invalid; replace the file itself.
+  if (missing.length > 0 && !statSync(current).isDirectory()) return current;
+  return join(current, missing[0] ?? "");
+}
+
+/**
+ * Re-bind grants after the runtime's read denies. A normal read restriction is
+ * default visibility and can be opened narrowly; explicit protected descendants
+ * are mounted again afterwards and still win.
+ */
+/**
+ * sandbox-exec profiles are shell-quoted by the runtime. Append exact allow
+ * exceptions after its parent deny rules, then repeat explicit protections.
+ */
+export function applyMacReadGrants(
+  command: string,
+  grants: FolderGrant[],
+  cwd: string,
+  protectedRead: string[],
+  platform: NodeJS.Platform = process.platform,
+  visibleRoots: string[] = [],
+  allowGitConfig = false,
+): string {
+  if (platform !== "darwin") return command;
+  const readable = new FilesystemPolicy({}, cwd, grants).grants();
+  const visible = new FilesystemPolicy(
+    {},
+    cwd,
+    visibleRoots.map((root) => ({ root, mode: "read" as const })),
+  ).grants();
+  if (readable.length === 0 && visible.length === 0) return command;
+  const profileMatch = /sandbox-exec -p ('(?:[^']|'\\''?)*') /.exec(command);
+  if (!profileMatch) return command;
+  const quoted = profileMatch[1];
+  const profile = quoted.slice(1, -1).replace(/'\\''/g, "'");
+  const protectedRules = [
+    ...new Set(
+      protectedRead.map((entry) => {
+        const path = normalizeFilesystemPattern(entry, cwd);
+        return hasFilesystemGlob(path)
+          ? `(deny file-read* (regex ${JSON.stringify(filesystemGlobToRegex(path))}))`
+          : `(deny file-read* (subpath ${JSON.stringify(path)}))`;
+      }),
+    ),
+  ];
+  const mandatoryWriteRules = readable.flatMap((grant) =>
+    mandatoryGrantProtections(grant.root, allowGitConfig).map(
+      (path) => `(deny file-write* (subpath ${JSON.stringify(path)}))`,
+    ),
+  );
+  const exceptions = [
+    ...[...readable, ...visible].map(
+      (grant) => `(allow file-read* (subpath ${JSON.stringify(grant.root)}))`,
+    ),
+    ...protectedRules,
+    ...mandatoryWriteRules,
+  ].join("\n");
+  return command.replace(quoted, shellQuote(`${profile}\n${exceptions}`));
+}
+
+export function applyExecutionGrants(
+  command: string,
+  grants: FolderGrant[],
+  cwd: string,
+  protectedRead: string[],
+  protectedWrite: string[],
+  normalReadAllowRoots: string[] = [],
+  allowGitConfig = false,
+  configuredWriteRoots: string[] = [],
+): string {
+  if (!command.startsWith("bwrap ")) return command;
+  const normalizedGrants = new FilesystemPolicy({}, cwd, grants).grants();
+  const sep = shellArgumentSeparator(command);
+  if (sep === -1) return command;
+  const argv = command.slice(0, sep);
+  const paths = (entries: string[]) =>
+    [
+      ...new Set(
+        entries.map((entry) =>
+          resolveFilesystemPath(expandFilesystemPath(entry, cwd)),
+        ),
+      ),
+    ].sort((a, b) => a.length - b.length);
+  const readProtected = paths(protectedRead);
+  const explicitWriteProtected = paths(protectedWrite);
+  // A parent write exclusion cannot be remounted after a child grant: that
+  // would reopen the parent for reads. Downgrade that grant to read-only; it
+  // remains an exact visibility exception without bypassing the exclusion.
+  const effectiveGrants = normalizedGrants.map((grant) =>
+    grant.mode === "read-write" &&
+    (explicitWriteProtected.some((path) => isWithin(grant.root, path)) ||
+      mandatoryGrantProtections(grant.root, allowGitConfig).includes(
+        grant.root,
+      ))
+      ? { ...grant, mode: "read" as const }
+      : grant,
+  );
+  const configuredWrites = new FilesystemPolicy(
+    {},
+    cwd,
+    configuredWriteRoots.map((root) => ({ root, mode: "read-write" as const })),
+  ).grants();
+  const writeProtected = paths([
+    ...explicitWriteProtected,
+    // The runtime always protects the command cwd, even when a broader grant
+    // is mounted after its generated denial binds.
+    ...mandatoryGrantProtections(cwd, allowGitConfig),
+    ...[...effectiveGrants, ...configuredWrites].flatMap((grant) =>
+      mandatoryGrantProtections(grant.root, allowGitConfig),
+    ),
+  ]);
+  const writeProtectionsToMount = writeProtected.filter(
+    (path) => !effectiveGrants.some((grant) => isWithin(grant.root, path)),
+  );
+  // These are the only source=target read-only binds this extension adds for
+  // default visibility. A read/write grant may intentionally replace one, and
+  // a later deny may hide the runtime's launch files (the start-up check then
+  // refuses); every other source=target bind came from the runtime as a
+  // protection.
+  const normalReadAllows = new Set([
+    ...paths(normalReadAllowRoots),
+    ...bootstrapAssets(command),
+  ]);
+  // The runtime places mandatory and configured write denies after its allow
+  // binds. A late read/write bind must preserve those exact mounts instead of
+  // accidentally reopening hooks, settings, or a denyWrite descendant.
+  const words = shellWords(argv);
+  if (!words) return command;
+  const preservedDenyBinds: string[] = [];
+  for (let index = 0; index < words.length - 2; index += 1) {
+    if (words[index] !== "--ro-bind") continue;
+    const source = words[index + 1];
+    const target = words[index + 2];
+    if (
+      source === "/dev/null" ||
+      (source === target && source !== "/" && !normalReadAllows.has(source))
+    ) {
+      preservedDenyBinds.push(
+        `--ro-bind ${shellQuote(source)} ${shellQuote(target)}`,
+      );
+    }
+  }
+  // A missing path is blocked from creation with a dev-null mount only where
+  // something in the jail could create it. Under a read-only parent bwrap
+  // cannot even create the mount point, and nothing needs blocking there.
+  const writableRoots = [
+    ...effectiveGrants.filter((grant) => grant.mode === "read-write"),
+    ...configuredWrites,
+  ].map((grant) => grant.root);
+  const creationBlock = (path: string): string | undefined => {
+    const component = firstMissingComponent(path);
+    if (!writableRoots.some((root) => isWithin(dirname(component), root)))
+      return undefined;
+    // A file ancestor (e.g. a worktree's `.git` pointer) is frozen onto itself:
+    // a mount point can't be deleted or recreated as a directory, and reads
+    // of the real content still work, unlike a /dev/null mask.
+    return existsSync(component)
+      ? `--ro-bind ${shellQuote(component)} ${shellQuote(component)}`
+      : `--ro-bind /dev/null ${shellQuote(component)}`;
+  };
+  const mounts = [
+    ...effectiveGrants.map(
+      (grant) =>
+        `${grant.mode === "read-write" ? "--bind" : "--ro-bind"} ${shellQuote(grant.root)} ${shellQuote(grant.root)}`,
+    ),
+    ...preservedDenyBinds,
+    // A read-only bind preserves ordinary reads while preventing a parent
+    // read/write grant from reopening an explicit write exclusion.
+    ...writeProtectionsToMount.map((path) =>
+      existsSync(path)
+        ? `--ro-bind ${shellQuote(path)} ${shellQuote(path)}`
+        : creationBlock(path),
+    ),
+    // Read protections must remain last: a preceding write exclusion exposes
+    // host contents, whereas tmpfs/dev-null hides them completely. A missing
+    // protected descendant gets the same creation-blocking dev-null mount.
+    ...readProtected.map((path) =>
+      !existsSync(path)
+        ? creationBlock(path)
+        : statSync(path).isDirectory()
+          ? `--tmpfs ${shellQuote(path)}`
+          : `--ro-bind /dev/null ${shellQuote(path)}`,
+    ),
+  ]
+    .filter((mount) => mount !== undefined)
+    .join(" ");
+  if (!mounts) return command;
+
+  return `${argv} ${mounts}${command.slice(sep)}`;
 }
 
 const DENIAL_PATTERNS = [
@@ -361,20 +708,136 @@ function takeCapture(command: string | undefined): ExecCapture | undefined {
   return entry?.capture;
 }
 
+/**
+ * Merge configured and execution-specific grants into the runtime input. The
+ * result is constructed for one process launch and never widens the session's
+ * shared configuration.
+ */
+function effectiveFilesystem(
+  filesystem: FilesystemConfig,
+  cwd: string,
+  executionGrants: FolderGrant[] = [],
+): FilesystemConfig {
+  const grants = new FilesystemPolicy(filesystem, cwd, [
+    ...(filesystem.grants ?? []),
+    ...executionGrants,
+  ]).grants();
+  const readRoots = grants.map((grant) => grant.root);
+  const writeRoots = grants
+    .filter((grant) => grant.mode === "read-write")
+    .map((grant) => grant.root);
+  return {
+    ...filesystem,
+    allowRead: [...new Set([...(filesystem.allowRead ?? []), ...readRoots])],
+    allowWrite: [...new Set([...(filesystem.allowWrite ?? []), ...writeRoots])],
+    // Explicit exclusions remain runtime denies beneath an approved root.
+    denyRead: [
+      ...new Set([
+        ...(filesystem.denyRead ?? []),
+        ...(filesystem.protectedRead ?? []),
+      ]),
+    ],
+    denyWrite: [
+      ...new Set([
+        ...(filesystem.denyWrite ?? []),
+        ...(filesystem.protectedRead ?? []),
+        ...(filesystem.protectedWrite ?? []),
+      ]),
+    ],
+  };
+}
+
 /** The confinement a command gets before it is handed to `bash -c`. */
 export async function wrapForSandbox(
   command: string,
   filesystem: FilesystemConfig,
+  cwd: string = process.cwd(),
+  executionGrants: FolderGrant[] = [],
 ): Promise<string> {
-  return applyAllowRead(
-    dropMissingDevNullBinds(await SandboxManager.wrapWithSandbox(command)),
-    filesystem,
+  const effective = effectiveFilesystem(filesystem, cwd, executionGrants);
+  const {
+    allowRead: _allowRead,
+    grants: _grants,
+    protectedRead: _protectedRead,
+    protectedWrite: _protectedWrite,
+    ...runtimeFilesystem
+  } = effective;
+  // Supplying the complete per-execution runtime policy is essential on macOS
+  // (where there is no bwrap argv to rewrite) and keeps mandatory runtime
+  // deny rules ordered after read/write grants on both platforms.
+  const wrapped = dropMissingDevNullBinds(
+    await SandboxManager.wrapWithSandbox(command, undefined, {
+      filesystem: runtimeFilesystem,
+    } as Parameters<typeof SandboxManager.wrapWithSandbox>[2]),
   );
+  const grants = [...(filesystem.grants ?? []), ...executionGrants];
+  return applyMacReadGrants(
+    applyExecutionGrants(
+      applyAllowRead(wrapped, effective),
+      grants,
+      cwd,
+      effective.protectedRead ?? [],
+      [...(effective.denyWrite ?? []), ...(effective.protectedWrite ?? [])],
+      effective.allowRead ?? [],
+      filesystem.allowGitConfig === true,
+      effective.allowWrite ?? [],
+    ),
+    grants,
+    cwd,
+    effective.protectedRead ?? [],
+    process.platform,
+    [...(effective.allowRead ?? []), ...(effective.allowWrite ?? [])],
+    filesystem.allowGitConfig === true,
+  );
+}
+
+export type BootstrapCheck = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Run one harmless command through the jail exactly as bash will. A jail that
+ * cannot start — its launch files hidden by a deny or missing from the
+ * machine — is refused at session start with the cause, instead of failing
+ * every command later with bash's bare "No such file or directory".
+ */
+export async function verifySandboxBootstrap(
+  filesystem: FilesystemConfig,
+  cwd: string = process.cwd(),
+): Promise<BootstrapCheck> {
+  const wrapped = await wrapForSandbox("true", filesystem, cwd);
+  if (!wrapped.startsWith("bwrap ")) return { ok: true };
+  const result = spawnSync("bash", ["-c", wrapped], {
+    cwd,
+    encoding: "utf-8",
+    timeout: 15_000,
+  });
+  if (result.status === 0) return { ok: true };
+
+  const denies = [
+    ...(filesystem.denyRead ?? []),
+    ...(filesystem.protectedRead ?? []),
+  ];
+  const causes = bootstrapAssets(wrapped).flatMap((asset) => {
+    if (!existsSync(asset)) return [`${asset} is missing on this machine`];
+    // The home tmpfs is the one deny the launch files are re-bound behind.
+    const hiding = denies.filter((entry) => {
+      const path = expandPath(entry, cwd).replace(/\/+$/, "");
+      return path !== HOME && isWithin(asset, path);
+    });
+    return hiding.length > 0
+      ? [`${asset} is hidden by denyRead ${hiding.join(", ")}`]
+      : [];
+  });
+  const detail =
+    causes.length > 0
+      ? causes.join("; ")
+      : (result.stderr ?? "").trim() || `exit status ${result.status}`;
+  return { ok: false, reason: `the sandbox cannot start a command: ${detail}` };
 }
 
 function createSandboxedBashOps(
   trace: boolean,
   filesystem: FilesystemConfig,
+  executionGrants: FolderGrant[] = [],
 ): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout }) {
@@ -395,7 +858,12 @@ function createSandboxedBashOps(
         inner = `strace -f -e trace=file -e status=failed -o ${shellQuote(tracePath)} bash -c ${shellQuote(command)}`;
       }
 
-      const wrappedCommand = await wrapForSandbox(inner, filesystem);
+      const wrappedCommand = await wrapForSandbox(
+        inner,
+        filesystem,
+        cwd,
+        executionGrants,
+      );
 
       return new Promise((resolve, reject) => {
         // Both streams: a wrapper like rtk reports the refusal on stdout.
@@ -526,64 +994,31 @@ function envPathReason(path: unknown): string | undefined {
  * Real path of the nearest existing ancestor plus the missing tail, following
  * dangling links, so a symlink at any component cannot redirect out of the roots.
  */
-function resolveRealPath(path: string): string {
-  let head = path;
-  const tail: string[] = [];
-  for (let hop = 0; hop < 40; hop++) {
-    try {
-      return join(realpathSync(head), ...tail);
-    } catch {
-      try {
-        head = resolve(dirname(head), readlinkSync(head));
-        continue;
-      } catch {
-        // Not a link: retry on the parent with this component held back.
-      }
-      const parent = dirname(head);
-      if (parent === head) return path;
-      tail.unshift(basename(head));
-      head = parent;
-    }
-  }
-  return path;
-}
-
-function isUnder(path: string, parent: string): boolean {
-  const root = parent.endsWith("/") ? parent.slice(0, -1) : parent;
-  return path === root || path.startsWith(`${root}/`);
-}
-
-/** The rules the jail applies to bash, applied to a file-tool path. */
+/** The shared policy applied at Pi's direct file/search-tool boundary. */
 export function sandboxPathReason(
   tool: string,
   rawPath: unknown,
   cwd: string,
-  policy: FilesystemConfig,
+  filesystem: FilesystemConfig,
+  executionGrants: FolderGrant[] = [],
 ): string | undefined {
   if (typeof rawPath !== "string" || !rawPath) return undefined;
-  const entries = (
-    key: "allowRead" | "allowWrite" | "denyRead" | "denyWrite",
-  ): string[] => (policy[key] ?? []).map((entry) => expandPath(entry, cwd));
-
-  const allowWrite = entries("allowWrite");
-  if (allowWrite.length === 0) return undefined;
-
-  const path = resolveRealPath(expandPath(rawPath, cwd));
-  if (tool === "write" || tool === "edit") {
-    if (entries("denyWrite").some((entry) => isUnder(path, entry))) {
-      return `write to ${path}: sandbox denyWrite`;
-    }
-    if (!allowWrite.some((entry) => isUnder(path, entry))) {
-      return `write to ${path}: outside the sandbox allowWrite list`;
-    }
-    return undefined;
+  const policy = new FilesystemPolicy(filesystem, cwd, [
+    ...(filesystem.grants ?? []),
+    ...executionGrants,
+  ]);
+  const mode = tool === "write" || tool === "edit" ? "write" : "read";
+  const decision =
+    mode === "read" && ["grep", "find", "ls"].includes(tool)
+      ? policy.evaluateReadTree(rawPath)
+      : policy.evaluate(mode, rawPath);
+  if (decision.state === "allowed") return undefined;
+  if (decision.state === "protected") {
+    return `${mode} of ${decision.path}: protected by the sandbox policy`;
   }
-  if (!entries("denyRead").some((entry) => isUnder(path, entry))) {
-    return undefined;
-  }
-  const readable = [...entries("allowRead"), ...allowWrite];
-  if (readable.some((entry) => isUnder(path, entry))) return undefined;
-  return `read of ${path}: hidden by the sandbox denyRead list`;
+  return mode === "write"
+    ? `write to ${decision.path}: outside the sandbox allowWrite list`
+    : `read of ${decision.path}: hidden by the sandbox denyRead list`;
 }
 
 /**
@@ -707,17 +1142,29 @@ export type CodassSandboxMarker = {
  * the very function `exec` runs its own commands through; it is cleared
  * whenever the marker turns inactive.
  */
-export type CodassSandboxWrap = (command: string) => Promise<string>;
+export type CodassSandboxWrap = (
+  command: string,
+  executionId?: string,
+) => Promise<string>;
+
+/** Injected only by the access-request flow added in a later ticket. */
+export type CodassSandboxGrantForExecution = (
+  executionId: string,
+  grants: FolderGrant[],
+) => void;
 
 function publishMarker(
   marker: CodassSandboxMarker,
   wrap?: CodassSandboxWrap,
+  grantForExecution?: CodassSandboxGrantForExecution,
 ): void {
   const globals = globalThis as {
     __codassSandbox?: CodassSandboxMarker;
     __codassSandboxWrap?: CodassSandboxWrap;
+    __codassSandboxGrantForExecution?: CodassSandboxGrantForExecution;
   };
   globals.__codassSandboxWrap = wrap;
+  globals.__codassSandboxGrantForExecution = grantForExecution;
   globals.__codassSandbox = marker;
 }
 
@@ -760,6 +1207,22 @@ export default function (pi: ExtensionAPI) {
   const permissions = new PermissionMachine({}, permissionHost);
   let filesystem: FilesystemConfig = {};
   let traceEnabled = false;
+  // A grant is consumed by the execution id it was issued for. Keeping this
+  // map outside the base policy prevents sibling calls from inheriting it.
+  const executionGrants = new Map<string, FolderGrant[]>();
+  const grantForExecution: CodassSandboxGrantForExecution = (id, grants) => {
+    executionGrants.set(
+      id,
+      grants.map((grant) => ({ ...grant })),
+    );
+  };
+  const grantsForExecution = (id: string): FolderGrant[] =>
+    executionGrants.get(id) ?? [];
+  const takeGrantsForExecution = (id: string): FolderGrant[] => {
+    const grants = grantsForExecution(id);
+    executionGrants.delete(id);
+    return grants;
+  };
 
   pi.registerTool({
     ...localBash,
@@ -770,7 +1233,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       const sandboxedBash = createBashTool(localCwd, {
-        operations: createSandboxedBashOps(traceEnabled, filesystem),
+        operations: createSandboxedBashOps(
+          traceEnabled,
+          filesystem,
+          grantsForExecution(id),
+        ),
       });
       return sandboxedBash.execute(id, params, signal, onUpdate);
     },
@@ -854,12 +1321,21 @@ export default function (pi: ExtensionAPI) {
       if (event.toolName === "write" || event.toolName === "edit") {
         reason = envPathReason(input.path);
       }
-      if (!reason) {
+      if (!reason && sandboxEnabled && sandboxInitialized) {
+        // Search/list tools use the cwd when their optional path is omitted;
+        // enforce that implicit filesystem access just as we do an explicit one.
+        const path =
+          typeof input.path === "string"
+            ? input.path
+            : ["grep", "find", "ls"].includes(event.toolName)
+              ? "."
+              : undefined;
         pathReason = sandboxPathReason(
           event.toolName,
-          input.path,
+          path,
           ctx.cwd,
           filesystem,
+          grantsForExecution(event.toolCallId),
         );
         reason = pathReason;
       }
@@ -867,18 +1343,25 @@ export default function (pi: ExtensionAPI) {
 
     if (!reason) return decide(event.toolName, input, ctx);
     const message = `sandbox guard: ${reason}`;
-    const blocked =
-      !ctx.hasUI ||
-      (await ctx.ui.select(message, ["Block", "Allow once"])) !== "Allow once";
-    if (blocked && pathReason) {
+    // A command approval must not turn into a filesystem capability. A later
+    // folder-access flow supplies an execution-bound policy grant instead.
+    if (pathReason) {
       logDenial({
         cwd: ctx.cwd,
         tool: event.toolName,
         path: input.path,
         reason: pathReason,
       });
+      return { block: true, reason: message };
     }
+    const blocked =
+      !ctx.hasUI ||
+      (await ctx.ui.select(message, ["Block", "Allow once"])) !== "Allow once";
     return blocked ? { block: true, reason: message } : undefined;
+  });
+
+  pi.on("tool_execution_end", (event) => {
+    executionGrants.delete(event.toolCallId);
   });
 
   pi.on("tool_result", (event) => {
@@ -909,6 +1392,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     permissions.reset();
+    executionGrants.clear();
+    filesystem = {};
+    traceEnabled = false;
+    sandboxEnabled = false;
+    sandboxInitialized = false;
     const noSandbox = pi.getFlag("no-sandbox") as boolean;
 
     if (noSandbox) {
@@ -949,9 +1437,21 @@ export default function (pi: ExtensionAPI) {
         "warning",
       );
     }
-    // allowRead is this extension's own key; the runtime schema does not know it.
-    const { allowRead: _allowRead, ...runtimeFilesystem } = filesystem;
+    // These extension-only keys are applied while each execution is built.
+    const initializedFilesystem = effectiveFilesystem(filesystem, ctx.cwd);
+    const {
+      allowRead: _allowRead,
+      grants: _grants,
+      protectedRead: _protectedRead,
+      protectedWrite: _protectedWrite,
+      ...runtimeFilesystem
+    } = initializedFilesystem;
 
+    const refuse = (reason: string) => {
+      sandboxEnabled = false;
+      publishMarker({ active: false, reason });
+      ctx.ui.notify(`Sandbox refused: ${reason}`, "error");
+    };
     const publishActive = () =>
       publishMarker(
         {
@@ -964,7 +1464,14 @@ export default function (pi: ExtensionAPI) {
             trace: traceEnabled,
           },
         },
-        (command) => wrapForSandbox(command, filesystem),
+        (command, executionId) =>
+          wrapForSandbox(
+            command,
+            filesystem,
+            ctx.cwd,
+            executionId ? takeGrantsForExecution(executionId) : [],
+          ),
+        grantForExecution,
       );
 
     try {
@@ -980,6 +1487,8 @@ export default function (pi: ExtensionAPI) {
         enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
       } as Parameters<typeof SandboxManager.initialize>[0]);
 
+      const bootstrap = await verifySandboxBootstrap(filesystem, ctx.cwd);
+      if (!bootstrap.ok) return refuse(bootstrap.reason);
       sandboxEnabled = true;
       sandboxInitialized = true;
       publishActive();
@@ -1000,6 +1509,8 @@ export default function (pi: ExtensionAPI) {
       // network bridge. With no domain allowlist that bridge is never built, so
       // filesystem sandboxing is still fully in force.
       if (!networkRestricted) {
+        const bootstrap = await verifySandboxBootstrap(filesystem, ctx.cwd);
+        if (!bootstrap.ok) return refuse(bootstrap.reason);
         sandboxEnabled = true;
         sandboxInitialized = true;
         publishActive();

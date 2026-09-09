@@ -53,10 +53,10 @@ export default function (pi: ExtensionAPI) {
 
   // Resolved per command, never once per session: extensions load in an
   // arbitrary order, so the sandbox may publish its wrap after this one starts.
-  const sandboxedWrap: SandboxWrap = async (command) => {
+  const sandboxedWrap: SandboxWrap = async (command, executionId) => {
     const resolved = resolveWrap(globalThis as Globals);
     if ("refusal" in resolved) throw new Error(resolved.refusal);
-    return resolved.wrap(command);
+    return resolved.wrap(command, executionId);
   };
 
   pi.on("session_start", (_event, ctx: ExtensionContext) => {
@@ -89,7 +89,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params) {
       const resolved = resolveWrap(globalThis as Globals);
       if ("refusal" in resolved) return text(resolved.refusal);
-      const task = activeRunner().run(params.command);
+      const task = activeRunner().run(params.command, _id);
       return text(`Started ${task.id}. Log: ${task.logPath}`);
     },
   });
