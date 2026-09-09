@@ -14,7 +14,9 @@ import {
   type StoredScope,
   type ToolCall,
   type Verdict,
+  digestOf,
   parseVerdict,
+  subjectOf,
 } from "./permissions.ts";
 
 type Stores = Record<StoredScope, string[]>;
@@ -31,6 +33,7 @@ function fakeHost(
   const stores: Stores = opts.stores ?? { worktree: [], global: [] };
   const judged: ToolCall[] = [];
   const asked: string[][] = [];
+  const messages: string[] = [];
   const host: PermissionHost = {
     hasUI: () => opts.hasUI ?? true,
     readRules: (scope) => [...stores[scope]],
@@ -41,12 +44,13 @@ function fakeHost(
       judged.push(call);
       return opts.verdict ?? { verdict: "ask", reason: "unclear" };
     },
-    select: async (_message, choices) => {
+    select: async (message, choices) => {
+      messages.push(message);
       asked.push([...choices]);
       return opts.choice;
     },
   };
-  return { host, stores, judged, asked };
+  return { host, stores, judged, asked, messages };
 }
 
 const CONFIG: PermissionConfig = {
@@ -282,4 +286,56 @@ test("a dismissed dialog is a refusal", async () => {
   const machine = new PermissionMachine(CONFIG, f.host);
   const blocked = await machine.decide({ toolName: "mcp__linear__list" });
   assert.equal(blocked?.block, true);
+});
+
+const longTask = "Read-only Standards axis review. ".repeat(100);
+const parallel: ToolCall = {
+  toolName: "subagent",
+  input: {
+    tasks: [
+      { agent: "general-purpose", task: longTask },
+      { agent: "general-purpose", task: longTask },
+      { agent: "builder", task: "Apply the plan" },
+    ],
+  },
+};
+
+test("a call too large to identify still reads in full to the dialog and the judge", async () => {
+  const call: ToolCall = {
+    toolName: "mcp__notion__create",
+    input: { title: "page", body: "x".repeat(3000) },
+  };
+  assert.equal(subjectOf(call), "");
+  const digest = digestOf(call);
+  assert.match(digest, /"title": "page"/);
+  assert.match(digest, /"body": "x{200}…"/);
+  assert.ok(digest.length < 400);
+
+  const f = fakeHost({ choice: "Allow once" });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  assert.equal(await machine.decide(call), undefined);
+  assert.match(
+    f.messages[0],
+    /^mcp__notion__create: \{\n\s+"title": "page",\n\s+"body": "x{200}…"\n\}\nunclear$/,
+  );
+});
+
+test("a subagent call is identified by its agents, so a grant covers any task", async () => {
+  assert.equal(subjectOf(parallel), "builder, general-purpose");
+  assert.match(digestOf(parallel), /"agent": "builder",\n\s+"task": "Apply the plan"/);
+
+  const f = fakeHost({ choice: "Allow for this worktree" });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  assert.equal(await machine.decide(parallel), undefined);
+  assert.deepEqual(f.stores.worktree, ["subagent(builder, general-purpose)"]);
+
+  const single: ToolCall = {
+    toolName: "subagent",
+    input: { agent: "builder", task: "Something else entirely" },
+  };
+  await machine.decide(single);
+  assert.equal(f.asked.length, 2);
+  f.stores.worktree.push("subagent(builder)");
+  assert.equal(await machine.decide(single), undefined);
+  assert.equal(f.asked.length, 2);
 });

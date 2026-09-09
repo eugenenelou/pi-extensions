@@ -103,7 +103,7 @@ import {
   type ToolCall,
   type Verdict,
   parseVerdict,
-  subjectOf,
+  digestOf,
 } from "./permissions.ts";
 
 type FilesystemConfig = Partial<SandboxRuntimeConfig["filesystem"]> &
@@ -1072,13 +1072,12 @@ function announceUnreadable(ctx: GuardCtx, message: string): void {
 
 /** The tool call as the model wrote it, for the judge to read. */
 function judgeInput(call: ToolCall, cwd: string): string {
-  const rendered = subjectOf(call);
   const subject =
     call.toolName === "bash"
       ? `command: ${call.command}`
       : typeof call.path === "string"
         ? `path: ${call.path}`
-        : `arguments: ${rendered || "(too large to render)"}`;
+        : `arguments: ${digestOf(call)}`;
   return `working directory: ${cwd}\ntool: ${call.toolName}\n${subject}`;
 }
 

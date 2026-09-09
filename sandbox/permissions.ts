@@ -58,6 +58,9 @@ export const JUDGE_TIMEOUT_MS = 30_000;
 /** Beyond this, arguments are too long to identify a call; nothing is remembered. */
 const ARGUMENTS_LIMIT = 2000;
 
+/** A string argument is shown to the judge and the dialog up to this length. */
+const LEAF_LIMIT = 200;
+
 export const CHOICES = [
   "Allow once",
   "Allow for this conversation",
@@ -75,6 +78,7 @@ allow: routine, reversible work.
 deny: destructive, irreversible work — data loss, credentials, publishing, or
   reaching machines the task never mentioned.
 ask: independent command risks a careful engineer would want to see before it runs.
+A string argument ending in … was cut for display; judge from what is shown.
 Filesystem locations, different project roots, and folders outside the working
  directory are authorized by the filesystem sandbox, never by this verdict.
 When unsure, answer ask.`;
@@ -98,11 +102,62 @@ function renderArguments(input: unknown): string {
   return text && text.length <= ARGUMENTS_LIMIT ? text : "";
 }
 
+/** Every string leaf cut to LEAF_LIMIT, the structure kept. */
+function abbreviate(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value.length > LEAF_LIMIT ? `${value.slice(0, LEAF_LIMIT)}…` : value;
+  }
+  if (Array.isArray(value)) return value.map(abbreviate);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        abbreviate(item),
+      ]),
+    );
+  }
+  return value;
+}
+
+/**
+ * The agents a subagent call delegates to. Its tasks are prose, so the rule
+ * that identifies such a call is the set of agents, not the arguments.
+ */
+function subagentsOf(input: unknown): string | undefined {
+  const args = (input ?? {}) as {
+    agent?: unknown;
+    tasks?: { agent?: unknown }[];
+    chain?: { agent?: unknown }[];
+  };
+  const agents = [
+    args.agent,
+    ...(args.tasks ?? []).map((task) => task?.agent),
+    ...(args.chain ?? []).map((step) => step?.agent),
+  ].filter((agent): agent is string => typeof agent === "string");
+  return agents.length ? [...new Set(agents)].sort().join(", ") : undefined;
+}
+
 /** The text a rule is matched against: the command, the path, or the arguments. */
 export function subjectOf(call: ToolCall): string {
   if (call.toolName === "bash") return call.command ?? "";
   if (typeof call.path === "string") return call.path;
+  if (call.toolName === "subagent") return subagentsOf(call.input) ?? "";
   return call.input === undefined ? "" : renderArguments(call.input);
+}
+
+/**
+ * What the call does, for a reader: the command, the path, or the arguments
+ * with long strings cut. Unlike the subject it never goes blank.
+ */
+export function digestOf(call: ToolCall): string {
+  if (call.toolName === "bash") return call.command ?? "";
+  if (typeof call.path === "string") return call.path;
+  if (call.input === undefined) return "";
+  try {
+    return JSON.stringify(abbreviate(call.input), null, 2);
+  } catch {
+    return "(arguments not serializable)";
+  }
 }
 
 /**
@@ -321,7 +376,7 @@ export class PermissionMachine {
       };
     }
     const choice = await this.host.select(
-      `${call.toolName}: ${subjectOf(call)}\n${why}`,
+      `${call.toolName}: ${digestOf(call)}\n${why}`,
       [...CHOICES],
     );
     if (choice === "Allow once") return undefined;
