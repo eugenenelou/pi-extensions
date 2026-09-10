@@ -374,6 +374,13 @@ function shellWords(command: string): string[] | undefined {
   return words;
 }
 
+const MOUNT_OPTION_ARITY: Record<string, number> = {
+  "--bind": 3,
+  "--ro-bind": 3,
+  "--dev-bind": 3,
+  "--tmpfs": 2,
+};
+
 /** The first nonexistent component is where a dev-null bind blocks creation. */
 const MANDATORY_NAMES = new Set([
   ".gitconfig",
@@ -539,8 +546,13 @@ export function applyExecutionGrants(
     // The runtime always protects the command cwd, even when a broader grant
     // is mounted after its generated denial binds.
     ...mandatoryGrantProtections(cwd, allowGitConfig),
+    // Outside the cwd only existing files are protected: blocking creation
+    // there costs a bwrap mount per name per root, and bwrap materializes each
+    // missing target as an empty file on the host.
     ...[...effectiveGrants, ...configuredWrites].flatMap((grant) =>
-      mandatoryGrantProtections(grant.root, allowGitConfig),
+      mandatoryGrantProtections(grant.root, allowGitConfig).filter(
+        (path) => isWithin(path, cwd) || existsSync(path),
+      ),
     ),
   ]);
   const writeProtectionsToMount = writeProtected.filter(
@@ -560,6 +572,16 @@ export function applyExecutionGrants(
   // accidentally reopening hooks, settings, or a denyWrite descendant.
   const words = shellWords(argv);
   if (!words) return command;
+  const argvMounts = new Set<string>();
+  for (let index = 0; index < words.length - 1; index += 1) {
+    const arity = MOUNT_OPTION_ARITY[words[index]];
+    if (arity) argvMounts.add(words.slice(index, index + arity).join("\0"));
+  }
+  // Without a grant bind nothing appended can reopen a runtime mount, so a
+  // mount the runtime already made is a pure duplicate.
+  const reassert = normalizedGrants.length > 0;
+  const alreadyMounted = (mount: string): boolean =>
+    !reassert && argvMounts.has(shellWords(mount)?.join("\0") ?? "");
   const preservedDenyBinds: string[] = [];
   for (let index = 0; index < words.length - 2; index += 1) {
     if (words[index] !== "--ro-bind") continue;
@@ -616,7 +638,8 @@ export function applyExecutionGrants(
           : `--ro-bind /dev/null ${shellQuote(path)}`,
     ),
   ]
-    .filter((mount) => mount !== undefined)
+    .filter((mount) => mount !== undefined && !alreadyMounted(mount))
+    .filter((mount, index, all) => all.indexOf(mount) === index)
     .join(" ");
   if (!mounts) return command;
 
@@ -805,11 +828,25 @@ export async function verifySandboxBootstrap(
 ): Promise<BootstrapCheck> {
   const wrapped = await wrapForSandbox("true", filesystem, cwd);
   if (!wrapped.startsWith("bwrap ")) return { ok: true };
-  const result = spawnSync("bash", ["-c", wrapped], {
-    cwd,
-    encoding: "utf-8",
-    timeout: 15_000,
-  });
+  const result = await new Promise<{ status: number | null; stderr: string }>(
+    (resolve) => {
+      const child = spawn("bash", ["-c", wrapped], {
+        cwd,
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      let stderr = "";
+      child.stderr?.on("data", (chunk) => (stderr += chunk));
+      const timer = setTimeout(() => child.kill("SIGKILL"), 15_000);
+      child.on("error", (error) => {
+        clearTimeout(timer);
+        resolve({ status: null, stderr: String(error) });
+      });
+      child.on("close", (status) => {
+        clearTimeout(timer);
+        resolve({ status, stderr });
+      });
+    },
+  );
   if (result.status === 0) return { ok: true };
 
   const denies = [
@@ -1179,6 +1216,9 @@ export default function (pi: ExtensionAPI) {
 
   let sandboxEnabled = false;
   let sandboxInitialized = false;
+  // The start-up probe runs while the session comes up; bash and path checks
+  // wait for its verdict instead of seeing a half-initialized sandbox.
+  let bootstrapPending: Promise<void> | undefined;
   /**
    * The context of the call being decided. The machine outlives any single
    * call — its conversation-scoped grants do — so the host reads the live one
@@ -1227,6 +1267,7 @@ export default function (pi: ExtensionAPI) {
     ...localBash,
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, _ctx) {
+      await bootstrapPending;
       if (!sandboxEnabled || !sandboxInitialized) {
         return localBash.execute(id, params, signal, onUpdate);
       }
@@ -1242,7 +1283,8 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.on("user_bash", () => {
+  pi.on("user_bash", async () => {
+    await bootstrapPending;
     if (!sandboxEnabled || !sandboxInitialized) return;
     return {
       operations: createSandboxedBashOps(traceEnabled, filesystem),
@@ -1299,6 +1341,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("tool_call", async (event, ctx) => {
+    await bootstrapPending;
     const input = event.input as { command?: string; path?: unknown };
     let reason: string | undefined;
     let pathReason: string | undefined;
@@ -1396,6 +1439,7 @@ export default function (pi: ExtensionAPI) {
     traceEnabled = false;
     sandboxEnabled = false;
     sandboxInitialized = false;
+    bootstrapPending = undefined;
     const noSandbox = pi.getFlag("no-sandbox") as boolean;
 
     if (noSandbox) {
@@ -1451,6 +1495,20 @@ export default function (pi: ExtensionAPI) {
       publishMarker({ active: false, reason });
       ctx.ui.notify(`Sandbox refused: ${reason}`, "error");
     };
+    const startBootstrap = (statusText: string, notice: string) => {
+      const pending = verifySandboxBootstrap(filesystem, ctx.cwd).then(
+        (bootstrap) => {
+          if (bootstrapPending === pending) bootstrapPending = undefined;
+          if (!bootstrap.ok) return refuse(bootstrap.reason);
+          sandboxEnabled = true;
+          sandboxInitialized = true;
+          publishActive();
+          ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", statusText));
+          ctx.ui.notify(notice, "info");
+        },
+      );
+      bootstrapPending = pending;
+    };
     const publishActive = () =>
       publishMarker(
         {
@@ -1486,43 +1544,21 @@ export default function (pi: ExtensionAPI) {
         enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
       } as Parameters<typeof SandboxManager.initialize>[0]);
 
-      const bootstrap = await verifySandboxBootstrap(filesystem, ctx.cwd);
-      if (!bootstrap.ok) return refuse(bootstrap.reason);
-      sandboxEnabled = true;
-      sandboxInitialized = true;
-      publishActive();
-
       const networkCount = config.network?.allowedDomains?.length ?? 0;
       const writeCount = config.filesystem?.allowWrite?.length ?? 0;
-      ctx.ui.setStatus(
-        "sandbox",
-        ctx.ui.theme.fg(
-          "accent",
-          `🔒 Sandbox: ${networkCount} domains, ${writeCount} write paths`,
-        ),
+      startBootstrap(
+        `🔒 Sandbox: ${networkCount} domains, ${writeCount} write paths`,
+        "Sandbox initialized",
       );
-      ctx.ui.notify("Sandbox initialized", "info");
     } catch (err) {
       // initialize() stores the config before it checks dependencies, and the
       // only dependency it needs beyond bwrap/rg is socat, used solely by the
       // network bridge. With no domain allowlist that bridge is never built, so
       // filesystem sandboxing is still fully in force.
       if (!networkRestricted) {
-        const bootstrap = await verifySandboxBootstrap(filesystem, ctx.cwd);
-        if (!bootstrap.ok) return refuse(bootstrap.reason);
-        sandboxEnabled = true;
-        sandboxInitialized = true;
-        publishActive();
-        ctx.ui.setStatus(
-          "sandbox",
-          ctx.ui.theme.fg(
-            "accent",
-            `🔒 Sandbox: network open, ${config.filesystem?.allowWrite?.length ?? 0} write paths`,
-          ),
-        );
-        ctx.ui.notify(
+        startBootstrap(
+          `🔒 Sandbox: network open, ${config.filesystem?.allowWrite?.length ?? 0} write paths`,
           `Sandbox initialized without network infrastructure (${err instanceof Error ? err.message : err})`,
-          "info",
         );
         return;
       }
