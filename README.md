@@ -1,21 +1,31 @@
 # pi-extensions
 
 Hand-written [pi](https://github.com/badlogic/pi-mono) extensions used by the
-codass `pi` deploy target. codass references these directories by absolute path
-from a generated `.pi/settings.json`:
+codass `pi` deploy target. pi loads everything from one flat `packages` list in
+`~/.pi/agent/settings.json` — npm packages and local extension directories
+alike, the latter by absolute path:
 
 ```json
 {
-  "packages": ["npm:pi-mcp-adapter"],
-  "extensions": [
-    "/home/eugene/projects/pi-extensions/subagents",
-    "/home/eugene/projects/pi-extensions/sandbox",
-    "/home/eugene/projects/pi-extensions/footer",
+  "packages": [
+    "npm:pi-mcp-adapter",
+    "npm:pi-web-access",
+    "npm:pi-vetter",
     "/home/eugene/projects/pi-extensions/background",
-    "/home/eugene/projects/pi-extensions/handoff"
+    "/home/eugene/projects/pi-extensions/footer",
+    "/home/eugene/projects/pi-extensions/goal",
+    "/home/eugene/projects/pi-extensions/handoff",
+    "/home/eugene/projects/pi-extensions/loop",
+    "/home/eugene/projects/pi-extensions/sandbox",
+    "/home/eugene/projects/pi-extensions/subagents",
+    "/home/eugene/projects/atlas/codass/codass_cli/targets/pi/codass-hooks.ts"
   ]
 }
 ```
+
+That list belongs to the operator: `bootstrap.sh` puts the entries above in
+place and nothing else rewrites it. The one exception is the codass hooks entry,
+which `codass deploy pi` adds and owns; bootstrap never touches it.
 
 `subagents/` and `sandbox/` carry their own `package.json`; they are pnpm
 workspace packages, so one `pnpm install` at the root covers them and the root
@@ -27,6 +37,30 @@ these files by stripping their types without checking them, so nothing else
 compares what an extension calls against what pi exports: run it after touching
 an extension, and after every pi version bump, where a renamed API surfaces as
 a silent runtime failure.
+
+## Bootstrap
+
+A fresh laptop:
+
+```
+git clone <this repo>
+pnpm install
+./bootstrap.sh
+codass deploy pi
+```
+
+`bootstrap.sh` owns the parts of `~/.pi` that are neither pi's own state nor
+codass's output, and is safe to re-run:
+
+- `pi install` for each package above that is not already in `packages`
+- `~/.pi/web-search.json` — `workflow: none`, `autoOpenBrowser: false` for
+  pi-web-access (note the path: it is not under `~/.pi/agent`)
+- `~/.pi/agent/extensions/permissions.json` — grants the sandbox's global layer
+  `web_search`, `fetch_content`, `get_search_content`, `source_check`
+- `~/.pi/agent/agents/researcher.md` — copied from `bootstrap/researcher.md`
+- `~/.pi/agent/AGENTS.md` — the line routing web access through `researcher`
+
+Every JSON write merges into the existing file, so operator keys survive.
 
 ## Config files
 
@@ -451,10 +485,12 @@ background/machine.test.ts`, `background/sandbox.test.ts`,
 `background/wrap.test.ts` (the last one spawns real processes), and
 `sandbox/background-wrap.test.ts`, which runs a background command through the
 real bwrap jail and expects a denied write to stay off the host. Those last two
-live in `sandbox/` for its `node_modules`, and skip unless bwrap is installed
-and the pi package is resolvable from there. `sandbox/hidden-home-jail.test.ts`
-is the other real-jail probe: the codass policy (`denyRead: ["~/"]`, one
-worktree allowed) with the runtime's launch files under that hidden home.
+live in `sandbox/` for its `node_modules` (pi is a devDependency there, so a
+plain `pnpm install` satisfies them), and skip unless bwrap is installed.
+`sandbox/hidden-home-jail.test.ts` is the other real-jail probe: the codass
+policy (`denyRead: ["~/"]`, one worktree allowed) with the runtime's launch
+files under that hidden home. The two real-jail probes share sandbox-runtime
+state, so run them with `--test-concurrency=1`.
 
 ## `handoff/`
 
@@ -535,7 +571,7 @@ spawned the session with the loop env — no command, no handler, no timer:
 CODASS_LOOP    the loop's name
 LOOP_SKILL     the tick skill, sent as /<skill>
 HANDOFF_PATH   the baton file; the loop's codass cache dir is its parent
-LOOP_CADENCE   an interval, 30s / 1m / 1h        (one of the two)
+LOOP_CADENCE   the interval in whole seconds     (one of the two)
 LOOP_SCHEDULE  a 5-field cron expression, local time
 HANDOFF_AT     context tokens at which the generation hands over
 MAX_ITERS      ticks after which the generation hands over

@@ -40,7 +40,7 @@ try {
   ({ SandboxManager } = await import("@anthropic-ai/sandbox-runtime"));
 } catch (err) {
   skip(
-    `${err instanceof Error ? err.message : err} — pi supplies @earendil-works/pi-coding-agent at runtime; link the installed pi package into sandbox/node_modules to run this probe`,
+    `${err instanceof Error ? err.message : err} — run pnpm install so sandbox/node_modules resolves @earendil-works/pi-coding-agent and @anthropic-ai/sandbox-runtime`,
   );
 }
 
