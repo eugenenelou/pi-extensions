@@ -6,13 +6,14 @@
  */
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -35,9 +36,10 @@ if (spawnSync("which", ["bwrap"], { stdio: "ignore" }).status !== 0) {
 let wrapForSandbox: typeof import("./index.ts").wrapForSandbox;
 let bootstrapAssets: typeof import("./index.ts").bootstrapAssets;
 let verifySandboxBootstrap: typeof import("./index.ts").verifySandboxBootstrap;
+let jailCommand: typeof import("./index.ts").jailCommand;
 let SandboxManager: typeof import("@anthropic-ai/sandbox-runtime").SandboxManager;
 try {
-  ({ wrapForSandbox, bootstrapAssets, verifySandboxBootstrap } =
+  ({ wrapForSandbox, bootstrapAssets, verifySandboxBootstrap, jailCommand } =
     await import("./index.ts"));
   ({ SandboxManager } = await import("@anthropic-ai/sandbox-runtime"));
 } catch (err) {
@@ -81,7 +83,7 @@ try {
   );
 }
 
-if (!(await wrapForSandbox("true", filesystem, work)).startsWith("bwrap ")) {
+if (!jailCommand(await wrapForSandbox("true", filesystem, work))) {
   skip("the sandbox runtime produced no bwrap command on this host");
 }
 
@@ -131,6 +133,36 @@ test("explicit denies beneath the worktree still hold", async () => {
   const write = await run(`echo TOKEN=2 > "${envFile}"`);
   assert.notEqual(write.status, 0);
   assert.equal(readFileSync(envFile, "utf-8"), "TOKEN=1\n");
+});
+
+test("the jail leaves no placeholder files behind for the paths it blocks", async () => {
+  const blocked = await run("echo hijack > .zshrc");
+  assert.notEqual(blocked.status, 0);
+  const dotfiles = readdirSync(work).filter((name) => name.startsWith("."));
+  assert.deepEqual(dotfiles, [".env"]);
+});
+
+test("a placeholder stays while another jail still mounts it", async () => {
+  const wrapped = await wrapForSandbox("sleep 2", filesystem, work);
+  const sleeper = spawn("bash", ["-c", wrapped], {
+    cwd: work,
+    stdio: "ignore",
+  });
+  const exited = new Promise<void>((resolve) =>
+    sleeper.on("close", () => resolve()),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const zshrc = join(work, ".zshrc");
+  assert.ok(existsSync(zshrc), "the sleeping jail's placeholder is missing");
+
+  await run("true");
+  assert.ok(
+    existsSync(zshrc),
+    "a finished jail removed a live jail's placeholder",
+  );
+
+  await exited;
+  assert.ok(!existsSync(zshrc), "the last jail left its placeholder behind");
 });
 
 test("the runtime's launch files are visible but not writable", async () => {

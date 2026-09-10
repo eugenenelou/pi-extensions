@@ -34,9 +34,10 @@ if (spawnSync("which", ["bwrap"], { stdio: "ignore" }).status !== 0) {
 }
 
 let wrapForSandbox: typeof import("./index.ts").wrapForSandbox;
+let jailCommand: typeof import("./index.ts").jailCommand;
 let SandboxManager: typeof import("@anthropic-ai/sandbox-runtime").SandboxManager;
 try {
-  ({ wrapForSandbox } = await import("./index.ts"));
+  ({ wrapForSandbox, jailCommand } = await import("./index.ts"));
   ({ SandboxManager } = await import("@anthropic-ai/sandbox-runtime"));
 } catch (err) {
   skip(
@@ -80,7 +81,7 @@ try {
 }
 
 const wrap = (command: string) => wrapForSandbox(command, filesystem);
-if (!(await wrap("true")).startsWith("bwrap ")) {
+if (!jailCommand(await wrap("true"))) {
   skip("the sandbox runtime produced no bwrap command on this host");
 }
 

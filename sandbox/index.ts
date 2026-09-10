@@ -198,6 +198,9 @@ function deepMerge(
   return result;
 }
 
+const DEV_NULL_BIND =
+  /--(?:ro-)?bind \/dev\/null ((?:"(?:\\.|[^"])*"|'[^']*'|\\.|[^\s])+)(?: )?/g;
+
 /**
  * bwrap creates a missing `--ro-bind` target as a read-only empty file, so every
  * deny path the runtime lists but the project does not have (`.bashrc`, `.env`,
@@ -211,16 +214,74 @@ export function dropMissingDevNullBinds(command: string): string {
   const argv = sep === -1 ? command : command.slice(0, sep);
   const rest = sep === -1 ? "" : command.slice(sep);
 
-  const filtered = argv.replace(
-    /--(?:ro-)?bind \/dev\/null ((?:"(?:\\.|[^"])*"|'[^']*'|\\.|[^\s])+)(?: )?/g,
-    (match, target: string) => {
-      const words = shellWords(target);
-      const path = words?.length === 1 ? words[0] : target;
-      return existsSync(path) ? match : "";
-    },
-  );
+  const filtered = argv.replace(DEV_NULL_BIND, (match, target: string) => {
+    const words = shellWords(target);
+    const path = words?.length === 1 ? words[0] : target;
+    return existsSync(path) ? match : "";
+  });
 
   return filtered + rest;
+}
+
+const JAIL = /^(?:exec 9<>\S+ && flock -s 9 && )?(bwrap .*)$/s;
+
+/** The bwrap invocation of a wrapped command, or undefined when it is not jailed. */
+export function jailCommand(command: string): string | undefined {
+  return JAIL.exec(command)?.[1];
+}
+
+/**
+ * The files bwrap will create on the host: every `/dev/null` bind whose target
+ * is missing gets an empty, read-only mount point in the real directory, and
+ * it outlives the jail.
+ */
+export function placeholderBinds(command: string): string[] {
+  const jail = jailCommand(command);
+  if (!jail) return [];
+  const sep = shellArgumentSeparator(jail);
+  const argv = sep === -1 ? jail : jail.slice(0, sep);
+  const targets: string[] = [];
+  for (const [, target] of argv.matchAll(DEV_NULL_BIND)) {
+    const words = shellWords(target);
+    const path = words?.length === 1 ? words[0] : target;
+    if (!existsSync(path)) targets.push(path);
+  }
+  return targets;
+}
+
+const issuedPlaceholders = new Set<string>();
+
+function jailLock(): string {
+  return join(getAgentDir(), "sandbox-jails.lock");
+}
+
+/** Removal needs the exclusive lock: no jail that mounted the file is alive. */
+function removeCommand(paths: string[]): string {
+  const list = paths.map(shellQuote).join(" ");
+  return `flock -n 9 && for __pi_f in ${list}; do [ -f "$__pi_f" ] && [ ! -s "$__pi_f" ] && rm -f -- "$__pi_f"; done 2>/dev/null`;
+}
+
+/**
+ * A jail holds the shared lock from before bwrap creates its placeholders
+ * until it exits, on an fd bwrap does not inherit; then it removes what it
+ * created. A jail killed before its trailer leaves that to `removePlaceholders`.
+ */
+function withJailLock(command: string): string {
+  if (!command.startsWith("bwrap ")) return command;
+  const placeholders = placeholderBinds(command);
+  for (const path of placeholders) issuedPlaceholders.add(path);
+  const removal =
+    placeholders.length > 0 ? `${removeCommand(placeholders)}; ` : "";
+  return `exec 9<>${shellQuote(jailLock())} && flock -s 9 && ${command} 9<&-; __pi_rc=$?; ${removal}exit $__pi_rc`;
+}
+
+function removePlaceholders(paths: Iterable<string>): void {
+  const list = [...paths];
+  if (list.length === 0) return;
+  spawnSync("bash", [
+    "-c",
+    `exec 9<>${shellQuote(jailLock())} && ${removeCommand(list)}`,
+  ]);
 }
 
 const HOME = homedir();
@@ -794,23 +855,25 @@ export async function wrapForSandbox(
     } as Parameters<typeof SandboxManager.wrapWithSandbox>[2]),
   );
   const grants = [...(filesystem.grants ?? []), ...executionGrants];
-  return applyMacReadGrants(
-    applyExecutionGrants(
-      applyAllowRead(wrapped, effective),
+  return withJailLock(
+    applyMacReadGrants(
+      applyExecutionGrants(
+        applyAllowRead(wrapped, effective),
+        grants,
+        cwd,
+        effective.protectedRead ?? [],
+        [...(effective.denyWrite ?? []), ...(effective.protectedWrite ?? [])],
+        effective.allowRead ?? [],
+        filesystem.allowGitConfig === true,
+        effective.allowWrite ?? [],
+      ),
       grants,
       cwd,
       effective.protectedRead ?? [],
-      [...(effective.denyWrite ?? []), ...(effective.protectedWrite ?? [])],
-      effective.allowRead ?? [],
+      process.platform,
+      [...(effective.allowRead ?? []), ...(effective.allowWrite ?? [])],
       filesystem.allowGitConfig === true,
-      effective.allowWrite ?? [],
     ),
-    grants,
-    cwd,
-    effective.protectedRead ?? [],
-    process.platform,
-    [...(effective.allowRead ?? []), ...(effective.allowWrite ?? [])],
-    filesystem.allowGitConfig === true,
   );
 }
 
@@ -827,7 +890,7 @@ export async function verifySandboxBootstrap(
   cwd: string = process.cwd(),
 ): Promise<BootstrapCheck> {
   const wrapped = await wrapForSandbox("true", filesystem, cwd);
-  if (!wrapped.startsWith("bwrap ")) return { ok: true };
+  if (!jailCommand(wrapped)) return { ok: true };
   const result = await new Promise<{ status: number | null; stderr: string }>(
     (resolve) => {
       const child = spawn("bash", ["-c", wrapped], {
@@ -902,6 +965,8 @@ function createSandboxedBashOps(
         executionGrants,
       );
 
+      const placeholders = placeholderBinds(wrappedCommand);
+
       return new Promise((resolve, reject) => {
         // Both streams: a wrapper like rtk reports the refusal on stdout.
         let output = "";
@@ -954,6 +1019,7 @@ function createSandboxedBashOps(
         child.on("close", (code) => {
           if (timeoutHandle) clearTimeout(timeoutHandle);
           signal?.removeEventListener("abort", onAbort);
+          if (signal?.aborted || timedOut) removePlaceholders(placeholders);
 
           if (signal?.aborted) {
             reject(new Error("aborted"));
@@ -1575,6 +1641,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    removePlaceholders(issuedPlaceholders);
     if (sandboxInitialized) {
       try {
         await SandboxManager.reset();
