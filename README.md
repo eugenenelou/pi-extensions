@@ -2,15 +2,15 @@
 
 Hand-written [pi](https://github.com/badlogic/pi-mono) extensions used by the
 codass `pi` deploy target. pi loads everything from one flat `packages` list in
-`~/.pi/agent/settings.json` — npm packages and local extension directories
-alike, the latter by absolute path:
+`~/.pi/agent/settings.json` — bundled npm packages and local extension
+directories alike, by path:
 
 ```json
 {
   "packages": [
-    "npm:pi-mcp-adapter",
-    "npm:pi-web-access",
-    "npm:pi-vetter",
+    "/home/eugene/.local/share/pi/bundles/pi-mcp-adapter",
+    "/home/eugene/.local/share/pi/bundles/pi-web-access",
+    "/home/eugene/.local/share/pi/bundles/pi-vetter",
     "/home/eugene/projects/pi-extensions/background",
     "/home/eugene/projects/pi-extensions/footer",
     "/home/eugene/projects/pi-extensions/goal",
@@ -26,6 +26,31 @@ alike, the latter by absolute path:
 That list belongs to the operator: `bootstrap.sh` puts the entries above in
 place and nothing else rewrites it. The one exception is the codass hooks entry,
 which `codass deploy pi` adds and owns; bootstrap never touches it.
+
+pi-mcp-adapter is the operator's too: `codass deploy pi` no longer puts it in a
+project's `.pi/settings.json` (it still does for a loop profile, which has its
+own agent dir), and `codass doctor` warns when the user settings lack it.
+
+## Bundled npm extensions
+
+pi loads an npm extension as raw TypeScript, one file per module of its whole
+dependency tree: pi-web-access alone opened ~1,000 files at every start.
+`bundle.ts` (esbuild) turns each package in its `PACKAGES` list into one
+tree-shaken file under `~/.local/share/pi/bundles/<name>/`, plus its skills and the
+data files it reads next to its own modules. The packages are devDependencies
+here; to update one, bump it, `pnpm install`, rebundle:
+
+```
+node --experimental-strip-types bundle.ts
+```
+
+Two constraints shape the output. pi serves its own API packages
+(`@earendil-works/*`, `typebox`) as virtual modules of its loader, but only
+for an import Node cannot resolve natively — so the bundles live outside this
+repo, whose `node_modules` would otherwise supply a second copy of pi. And a
+file that big must not go through pi's loader itself (it transpiles, seconds on
+a cold cache), so each extension is a tiny ESM entry that imports the virtual
+modules and hands them to a CommonJS body that Node loads natively.
 
 `subagents/` and `sandbox/` carry their own `package.json`; they are pnpm
 workspace packages, so one `pnpm install` at the root covers them and the root
@@ -52,7 +77,8 @@ codass deploy pi
 `bootstrap.sh` owns the parts of `~/.pi` that are neither pi's own state nor
 codass's output, and is safe to re-run:
 
-- `pi install` for each package above that is not already in `packages`
+- the bundles under `~/.local/share/pi/bundles` (built by `bundle.ts`), and
+  `pi install` for each package above that is not already in `packages`
 - `~/.pi/web-search.json` — `workflow: none`, `autoOpenBrowser: false` for
   pi-web-access (note the path: it is not under `~/.pi/agent`)
 - `~/.pi/agent/extensions/permissions.json` — grants the sandbox's global layer

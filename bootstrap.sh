@@ -29,9 +29,15 @@ json_merge() {
   mv "$tmp" "$file"
 }
 
-install_package "npm:pi-mcp-adapter"
-install_package "npm:pi-web-access"
-install_package "npm:pi-vetter"
+for legacy in npm:pi-mcp-adapter npm:pi-web-access npm:pi-vetter; do
+  if [ -f "$SETTINGS" ] && jq -e --arg p "$legacy" '(.packages // []) | index($p)' "$SETTINGS" >/dev/null; then
+    pi remove "$legacy"
+  fi
+done
+(cd "$REPO" && pnpm install --frozen-lockfile && node --experimental-strip-types bundle.ts)
+for bundle in pi-mcp-adapter pi-web-access pi-vetter; do
+  install_package "$HOME/.local/share/pi/bundles/$bundle"
+done
 for ext in background footer goal handoff loop sandbox subagents; do
   install_package "$REPO/$ext"
 done

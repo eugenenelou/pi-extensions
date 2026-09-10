@@ -1,0 +1,13 @@
+diff --git a/dist/sandbox/sandbox-manager.js b/dist/sandbox/sandbox-manager.js
+index 793af2fe5acc6e1978cd0ae2120c2005d30d0be2..9e9b7a5a3b5be61d632c397fc7b57488ef750096 100644
+--- a/dist/sandbox/sandbox-manager.js
++++ b/dist/sandbox/sandbox-manager.js
+@@ -1,7 +1,7 @@
+ import { createHttpProxyServer } from './http-proxy.js';
+ import { createSocksProxyServer } from './socks-proxy.js';
+ import { logForDebugging } from '../utils/debug.js';
+-import { cloneDeep } from 'lodash-es';
++import cloneDeep from 'lodash-es/cloneDeep.js';
+ import { getPlatform } from '../utils/platform.js';
+ import * as fs from 'fs';
+ import { wrapCommandWithSandboxLinux, initializeLinuxNetworkBridge, hasLinuxSandboxDependenciesSync, } from './linux-sandbox-utils.js';
