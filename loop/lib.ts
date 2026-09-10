@@ -4,16 +4,6 @@
 const DEFAULT_HANDOFF_AT = 120000;
 const DEFAULT_MAX_ITERS = 10;
 
-const CADENCE = /^(\d+)([smh])$/;
-const CADENCE_UNIT_SECONDS: Record<string, number> = { s: 1, m: 60, h: 3600 };
-
-/** A cadence string (`30s`, `1m`, `1h`) in seconds, or undefined when malformed. */
-export function parseCadence(cadence: string): number | undefined {
-  const match = CADENCE.exec(cadence.trim());
-  if (!match) return undefined;
-  return Number(match[1]) * CADENCE_UNIT_SECONDS[match[2]];
-}
-
 /** A parsed 5-field cron expression, answering next-fire in local time. */
 export interface Schedule {
   expr: string;
@@ -188,6 +178,13 @@ function intOr(value: string | undefined, fallback: number): number {
   return value !== undefined && Number.isInteger(parsed) ? parsed : fallback;
 }
 
+/** A whole number of seconds, or undefined when the value is not a positive one. */
+function positiveSeconds(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 /**
  * The loop config from the spawn env, or undefined when this is not a loop
  * session — the whole extension is inert then.
@@ -205,9 +202,7 @@ export function parseLoopEnv(
   const schedule = env.LOOP_SCHEDULE
     ? parseSchedule(env.LOOP_SCHEDULE)
     : undefined;
-  const cadenceSeconds = env.LOOP_CADENCE
-    ? parseCadence(env.LOOP_CADENCE)
-    : undefined;
+  const cadenceSeconds = positiveSeconds(env.LOOP_CADENCE);
   if (!schedule && cadenceSeconds === undefined) return undefined;
   return {
     name,

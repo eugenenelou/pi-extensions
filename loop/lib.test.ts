@@ -5,19 +5,10 @@ import {
   iterationCounterPath,
   lastTickPath,
   nextDueEpoch,
-  parseCadence,
   parseLoopEnv,
   parseSchedule,
   staleArchives,
 } from "./lib.ts";
-
-test("cadence strings parse into seconds", () => {
-  assert.equal(parseCadence("30s"), 30);
-  assert.equal(parseCadence("5m"), 300);
-  assert.equal(parseCadence("2h"), 7200);
-  assert.equal(parseCadence("5"), undefined);
-  assert.equal(parseCadence("5d"), undefined);
-});
 
 test("a cron expression answers its next fire in local time", () => {
   const schedule = parseSchedule("0 8 * * 1");
@@ -71,7 +62,7 @@ test("the spawn env becomes the loop config", () => {
   const config = parseLoopEnv({
     CODASS_LOOP: "daily",
     LOOP_SKILL: "loop-daily",
-    LOOP_CADENCE: "30m",
+    LOOP_CADENCE: "1800",
     HANDOFF_PATH: "/c/loops/daily/handoff.md",
     HANDOFF_AT: "90000",
     MAX_ITERS: "6",
@@ -94,7 +85,7 @@ test("the thresholds fall back to codass's defaults", () => {
   const config = parseLoopEnv({
     CODASS_LOOP: "daily",
     LOOP_SKILL: "loop-daily",
-    LOOP_CADENCE: "1m",
+    LOOP_CADENCE: "60",
     HANDOFF_PATH: "/c/loops/daily/handoff.md",
   });
   assert.equal(config?.handoffAt, 120000);
@@ -108,14 +99,17 @@ test("without the loop env there is no loop", () => {
     parseLoopEnv({ CODASS_LOOP: "daily", LOOP_SKILL: "x" }),
     undefined,
   );
-  assert.equal(
-    parseLoopEnv({
-      CODASS_LOOP: "daily",
-      LOOP_SKILL: "x",
-      LOOP_CADENCE: "soon",
-    }),
-    undefined,
-  );
+  for (const cadence of ["soon", "30m", "0", "-60", "1.5"]) {
+    assert.equal(
+      parseLoopEnv({
+        CODASS_LOOP: "daily",
+        LOOP_SKILL: "x",
+        HANDOFF_PATH: "/c/loops/daily/handoff.md",
+        LOOP_CADENCE: cadence,
+      }),
+      undefined,
+    );
+  }
 });
 
 test("the state files sit beside the baton codass named", () => {

@@ -47,7 +47,7 @@ function fakeHost(
 
 test("a cadence loop ticks when due and idle, and stamps on send", () => {
   const { host, state, sent } = fakeHost({ now: 1000, lastTick: 1000 });
-  const machine = new LoopMachine(config({ LOOP_CADENCE: "1m" }), host);
+  const machine = new LoopMachine(config({ LOOP_CADENCE: "60" }), host);
   machine.start();
 
   state.now = 1030;
@@ -63,7 +63,7 @@ test("a cadence loop ticks when due and idle, and stamps on send", () => {
 
 test("a due tick defers while the agent is busy", () => {
   const { host, state, sent } = fakeHost({ now: 2000, lastTick: 1000 });
-  const machine = new LoopMachine(config({ LOOP_CADENCE: "1m" }), host);
+  const machine = new LoopMachine(config({ LOOP_CADENCE: "60" }), host);
 
   state.idle = false;
   machine.poll();
@@ -77,7 +77,7 @@ test("a due tick defers while the agent is busy", () => {
 
 test("a missing stamp forces a tick", () => {
   const { host, state, sent } = fakeHost({ now: 5000, lastTick: 4999 });
-  const machine = new LoopMachine(config({ LOOP_CADENCE: "1h" }), host);
+  const machine = new LoopMachine(config({ LOOP_CADENCE: "3600" }), host);
 
   machine.poll();
   assert.deepEqual(sent, []);
@@ -109,7 +109,7 @@ test("a cron loop anchors its first fire to the next window, not to now", () => 
 test("the run count crosses max_iters into exactly one handoff", () => {
   const { host, state, handoffs } = fakeHost();
   const machine = new LoopMachine(
-    config({ LOOP_CADENCE: "1m", MAX_ITERS: "3" }),
+    config({ LOOP_CADENCE: "60", MAX_ITERS: "3" }),
     host,
   );
 
@@ -131,7 +131,7 @@ test("the run count crosses max_iters into exactly one handoff", () => {
 test("context past handoff_at hands off, and the successor's count restarts", () => {
   const { host, state, handoffs } = fakeHost();
   const cfg = config({
-    LOOP_CADENCE: "1m",
+    LOOP_CADENCE: "60",
     HANDOFF_AT: "1000",
     MAX_ITERS: "99",
   });
@@ -156,7 +156,7 @@ test("context past handoff_at hands off, and the successor's count restarts", ()
 test("no tick fires once the handoff is requested", () => {
   const { host, state, sent, handoffs } = fakeHost({ lastTick: null });
   const machine = new LoopMachine(
-    config({ LOOP_CADENCE: "1m", MAX_ITERS: "1" }),
+    config({ LOOP_CADENCE: "60", MAX_ITERS: "1" }),
     host,
   );
 
@@ -171,7 +171,7 @@ test("no tick fires once the handoff is requested", () => {
 test("a handoff that never reached a successor is retried on a later tick", () => {
   const { host, state, sent, handoffs } = fakeHost({ now: 1000, lastTick: null });
   const machine = new LoopMachine(
-    config({ LOOP_CADENCE: "1m", MAX_ITERS: "1" }),
+    config({ LOOP_CADENCE: "60", MAX_ITERS: "1" }),
     host,
   );
 
