@@ -12,6 +12,7 @@ import {
   FilesystemPolicy,
   type FolderGrant,
 } from "./filesystem-policy.ts";
+import { mergeFilesystem } from "./index.ts";
 
 const roots: string[] = [];
 
@@ -279,6 +280,17 @@ test("execution policies add grants without mutating their shared base policy", 
   const execution = base.withGrants([{ root: f.allowed, mode: "read" }]);
   assert.equal(execution.evaluate("read", join(f.allowed, "a.txt")).state, "allowed");
   assert.equal(base.evaluate("read", join(f.allowed, "a.txt")).state, "missing");
+});
+
+test("a project layer adds to the machine's allow lists rather than replacing them", () => {
+  const merged = mergeFilesystem(
+    { allowRead: ["~/.local"], allowWrite: ["~/.cache"], denyWrite: ["~/.ssh"] },
+    { allowWrite: ["/work"], denyWrite: ["/work/.env"] },
+  );
+
+  assert.deepEqual(merged.allowRead, ["~/.local"]);
+  assert.deepEqual(merged.allowWrite, ["~/.cache", "/work"]);
+  assert.deepEqual(merged.denyWrite, ["/work/.env"]);
 });
 
 test.after(() => {

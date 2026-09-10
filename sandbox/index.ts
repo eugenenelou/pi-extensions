@@ -163,6 +163,28 @@ function loadConfig(cwd: string): SandboxConfig {
   return configValues(layers).reduce<SandboxConfig>(deepMerge, DEFAULT_CONFIG);
 }
 
+/**
+ * Merge one filesystem layer over another, adding to the allow lists instead of
+ * replacing them.
+ *
+ * The agent-dir layer is the machine's: which paths under a hidden home hold
+ * the toolchain. The project layer is the checkout's: its own root, its store,
+ * its env-file denies. Replacing meant whichever layer wrote a key last erased
+ * the other's, so a project could silently take away the machine's access to
+ * its own tools. Denies still replace — a layer that narrows must be able to.
+ */
+export function mergeFilesystem(
+  base: FilesystemConfig,
+  overrides: Partial<FilesystemConfig>,
+): FilesystemConfig {
+  const merged = { ...base, ...overrides };
+  for (const key of ["allowRead", "allowWrite"] as const) {
+    const combined = [...(base[key] ?? []), ...(overrides[key] ?? [])];
+    if (combined.length > 0) merged[key] = [...new Set(combined)];
+  }
+  return merged;
+}
+
 function deepMerge(
   base: SandboxConfig,
   overrides: Partial<SandboxConfig>,
@@ -174,7 +196,10 @@ function deepMerge(
     result.network = { ...base.network, ...overrides.network };
   }
   if (overrides.filesystem) {
-    result.filesystem = { ...base.filesystem, ...overrides.filesystem };
+    result.filesystem = mergeFilesystem(
+      base.filesystem ?? {},
+      overrides.filesystem,
+    );
   }
   if (overrides.trace !== undefined) result.trace = overrides.trace;
 

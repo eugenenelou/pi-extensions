@@ -109,7 +109,7 @@ read by `shared/config.ts`:
 One relative path for both layers, so a file declared once is right for a loop
 profile and for a worktree. The helper only reads, and tells absent from
 unparseable; each extension keeps its own merge rule — `sandbox.json`
-deep-merges over the defaults, `permissions.json` unions and fails closed on an
+deep-merges over the defaults and unions its allow lists, `permissions.json` unions and fails closed on an
 unparseable file, `handoff.json` resolves each layer's `promptFile` against
 that layer's own base, `judge.json` is last wins.
 
@@ -288,8 +288,11 @@ vendored from pi-mono `examples/extensions/sandbox/`, plus the guards that cover
 what the jail does not: a deny list of dangerous commands, and the file tools,
 which reach the filesystem directly.
 
-Config is merged from the two `extensions/sandbox.json` layers (project wins),
-on top of the extension defaults.
+Config is merged from the two `extensions/sandbox.json` layers on top of the
+extension defaults. The project layer wins per key, except `allowRead` and
+`allowWrite`, which are the union of both: the agent-dir layer says which paths
+under a hidden home hold this machine's toolchain, and a checkout must not be
+able to take that away.
 
 Four deliberate changes to the upstream file:
 
