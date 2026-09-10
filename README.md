@@ -2,8 +2,8 @@
 
 Hand-written [pi](https://github.com/badlogic/pi-mono) extensions used by the
 codass `pi` deploy target. pi loads everything from one flat `packages` list in
-`~/.pi/agent/settings.json` — bundled npm packages and local extension
-directories alike, by path:
+`~/.pi/agent/settings.json` — bundled npm packages, local extension directories
+and single extension files alike, by path:
 
 ```json
 {
@@ -18,14 +18,23 @@ directories alike, by path:
     "/home/eugene/projects/pi-extensions/loop",
     "/home/eugene/projects/pi-extensions/sandbox",
     "/home/eugene/projects/pi-extensions/subagents",
-    "/home/eugene/projects/atlas/codass/codass_cli/targets/pi/codass-hooks.ts"
+    "/home/eugene/projects/atlas/codass/codass_cli/targets/pi/codass-hooks.ts",
+    "/home/eugene/projects/atlas/codass/codass_cli/targets/pi/codass-rules.ts"
   ]
 }
 ```
 
 That list belongs to the operator: `bootstrap.sh` puts the entries above in
-place and nothing else rewrites it. The one exception is the codass hooks entry,
-which `codass deploy pi` adds and owns; bootstrap never touches it.
+place and nothing else rewrites it. The exception is the two codass entries,
+which `codass deploy pi` adds and owns; bootstrap never touches them.
+`codass-hooks.ts` runs the enabled packs' hook scripts on pi tool calls, fed
+Claude's stdin shape, and keeps the session records codass reads to list and
+resume pi sessions. `codass-rules.ts` gives pi the per-rule path scoping it has
+no notion of: a deploy writes the glob-scoped rules — title, globs, absolute
+path of the body — to a `codass-rules.json` manifest beside `APPEND_SYSTEM.md`,
+which carries every other rule, and the extension appends a rule to the first
+`read`, `edit` or `write` result inside the project whose path its globs match,
+once per conversation.
 
 pi-mcp-adapter is the operator's too: `codass deploy pi` no longer puts it in a
 project's `.pi/settings.json` (it still does for a loop profile, which has its
