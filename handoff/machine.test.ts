@@ -143,56 +143,41 @@ test("idle: writes the file, attaches the handoff first, replays captured inputs
   assert.equal(f.widget, undefined);
 });
 
-test("file-only: writes the handoff without switching, attaching, replaying, or capturing input", async () => {
-  const f = fakeHost();
+test("tree navigation drops an armed run instead of handing off on pi's abort", async () => {
+  const f = fakeHost({ idle: false });
   const m = new HandoffMachine();
-  const done = m.file(f.host, "keep the migration details");
+  const done = m.command(f.host, "");
+  m.onInput("for the new session", "followUp");
+  f.editor = "typing";
 
-  assert.equal(m.phase, "writing");
-  assert.equal(m.onInput("leave this in the current session", undefined), false);
-  f.finishHandoff("## Next\nrun migrations\n");
-  await done;
-
-  assert.equal(
-    f.log.find((line) => line.startsWith("write:")),
-    "write:/s/x.handoff.md:## Next\nrun migrations\n",
-  );
-  assert.equal(f.log.includes("newSession"), false);
-  assert.deepEqual(f.next.appended, []);
-  assert.deepEqual(f.next.sent, []);
+  m.onTreeNavigation();
   assert.equal(m.phase, "idle");
   assert.equal(f.widget, undefined);
-  assert.ok(
-    f.log.includes("notify:Handoff file written (/s/x.handoff.md)"),
-  );
+  assert.equal(f.editor, "for the new session\n\ntyping");
+  assert.ok(f.log.includes("notify:Handoff cancelled: navigating the session tree"));
+
+  f.settle();
+  await tick();
+  await done;
+  assert.equal(m.phase, "idle");
+  assert.equal(f.signal, undefined);
+  assert.equal(f.log.includes("newSession"), false);
 });
 
-test("/handoff-file cancels an in-progress /handoff", async () => {
+test("tree navigation aborts a generation in flight", async () => {
   const f = fakeHost();
   const m = new HandoffMachine();
   const done = m.command(f.host, "");
-  m.onInput("queued", undefined);
+  assert.equal(m.phase, "writing");
 
-  await m.file(f.host, "");
-  assert.equal(f.signal?.aborted, true);
-  assert.equal(f.editor, "queued");
-  assert.equal(m.phase, "idle");
-  assert.equal(f.widget, undefined);
-  f.finishHandoff(null);
-  await done;
-});
-
-test("/handoff cancels an in-progress /handoff-file", async () => {
-  const f = fakeHost();
-  const m = new HandoffMachine();
-  const done = m.file(f.host, "");
-
-  await m.command(f.host, "");
+  m.onTreeNavigation();
   assert.equal(f.signal?.aborted, true);
   assert.equal(m.phase, "idle");
-  assert.equal(f.widget, undefined);
-  f.finishHandoff(null);
+
+  f.finishHandoff("## Next\ntoo late\n");
   await done;
+  await tick();
+  assert.equal(f.log.some((l) => l.startsWith("write:")), false);
   assert.equal(f.log.includes("newSession"), false);
 });
 

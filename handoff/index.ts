@@ -1,7 +1,8 @@
 /**
  * /handoff [focus note]: write a forward-looking handoff beside the session
  * transcript and continue in a new session with it in context. `/handoff-file`
- * writes the same handoff without leaving the current session.
+ * writes the same handoff without leaving the current session; it is an
+ * ordinary command, and lives in `file.ts` outside the machine.
  *
  * The behaviour lives in `machine.ts`; this file builds its host from pi's
  * extension context. Typed while the agent is running, the command arms and
@@ -45,10 +46,13 @@ import {
   parseHandoffRequest,
   promptFromFile,
 } from "./lib.ts";
+import { type FileHost, HandoffFile } from "./file.ts";
 import { HandoffMachine, headlessHost, type Host } from "./machine.ts";
 import { configLayers } from "../shared/config.ts";
 
 const WIDGET_KEY = "handoff";
+/** The file writer's status line, so it never fights the machine's widget. */
+const FILE_WIDGET_KEY = "handoff-file";
 
 /** Global `extensions/handoff.json` under the agent dir, project under `.pi/`. */
 function loadConfig(cwd: string): HandoffConfig {
@@ -117,12 +121,16 @@ function branchMessages(branch: SessionEntry[]): AgentMessage[] {
     .filter((m) => m !== undefined);
 }
 
-function setWidget(ctx: ExtensionContext, lines: string[] | undefined): void {
+function setWidget(
+  ctx: ExtensionContext,
+  key: string,
+  lines: string[] | undefined,
+): void {
   if (lines === undefined) {
-    ctx.ui.setWidget(WIDGET_KEY, undefined);
+    ctx.ui.setWidget(key, undefined);
     return;
   }
-  ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => {
+  ctx.ui.setWidget(key, (_tui, theme) => {
     const container = new Container();
     container.addChild(new Spacer(1));
     for (const line of lines) {
@@ -141,7 +149,7 @@ function hostFor(
     isIdle: () => ctx.isIdle(),
     waitForIdle: () => ctx.waitForIdle(),
     notify: (message, level) => ctx.ui.notify(message, level),
-    setWidget: (lines) => setWidget(ctx, lines),
+    setWidget: (lines) => setWidget(ctx, WIDGET_KEY, lines),
     getEditorText: () => ctx.ui.getEditorText(),
     setEditorText: (text) => ctx.ui.setEditorText(text),
     conversation: () => {
@@ -217,8 +225,18 @@ function hostFor(
   };
 }
 
+/** The file writer's host: the handoff host, with a status line of its own. */
+function fileHostFor(ctx: ExtensionCommandContext, host: Host): FileHost {
+  if (ctx.mode !== "tui") return { ...headlessHost(host), setStatus: () => {} };
+  return {
+    ...host,
+    setStatus: (lines) => setWidget(ctx, FILE_WIDGET_KEY, lines),
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   const machine = new HandoffMachine();
+  const file = new HandoffFile();
   let auto = new AutoHandoff();
   /** Set by a bus request, consumed by the command run it dispatches. */
   let requested: HandoffRequest | undefined;
@@ -274,6 +292,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => machine.onSessionShutdown());
 
+  // Tree navigation moves the branch under a run without ending the session,
+  // and pi aborts the running turn on its way there: both events, so an armed
+  // run is dropped before that abort can be read as the agent settling.
+  pi.on("session_before_tree", async () => machine.onTreeNavigation());
+  pi.on("session_tree", async () => machine.onTreeNavigation());
+
   pi.registerCommand("handoff", {
     description:
       "Write a handoff file and continue in a new session [focus note]",
@@ -327,12 +351,9 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       // Unlike /handoff, every argument is a focus note: `auto` has no
-      // special meaning, and this mode works without a terminal.
+      // special meaning, and this command works without a terminal.
       const host = hostFor(ctx, auto.setting(), auto.hold());
-      void machine.file(
-        ctx.mode === "tui" ? host : headlessHost(host),
-        args.trim(),
-      );
+      void file.write(fileHostFor(ctx, host), args.trim());
     },
   });
 }

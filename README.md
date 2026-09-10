@@ -514,7 +514,14 @@ is not a task for the new session.
 and `<session>.handoff.md` path, overwriting that file without switching
 sessions or adding anything to the conversation. It works without a TUI, does
 not capture or replay input, and treats `auto …` as an ordinary focus note.
-Either handoff command cancels a handoff already in progress.
+It is an ordinary command (`file.ts`, outside the machine): nothing to cancel,
+and it neither interrupts a `/handoff` in progress nor holds one back. pi runs
+a registered command at once, streaming or not — Alt+Enter cannot defer one, it
+selects a queue commands never enter — so the wait is the command's own: typed
+while the agent runs it shows `Handoff file: scheduled, writes when the agent
+settles` on a status line of its own — that line is the whole signal, nothing
+is notified until the file is there — then writes once the turn ends. A second
+`/handoff-file` while one is in flight is refused, not queued.
 
 The command returns at once and does its work in the background: pi's input
 loop waits for a command handler, and inputs typed meanwhile would be held
@@ -533,6 +540,11 @@ follow-ups are captured; Enter (steering) still goes to the running agent.
 captured inputs go back into the editor ahead of any text already there. Esc
 while armed does what it always does, aborts the agent, which counts as
 settled, so the handoff then starts writing.
+
+`/tree` also cancels, on both `session_before_tree` and `session_tree`:
+navigating moves the branch under the run without ending the session, and pi
+aborts the running turn on its way there — which an armed run would otherwise
+read as the agent settling and hand off on.
 
 ### Prompt file
 
@@ -556,7 +568,7 @@ interface with no pi imports; `index.ts` builds the host from the extension
 context. Both it and the pure helpers in `lib.ts` are tested with fakes:
 
 ```
-node --experimental-strip-types --test handoff/machine.test.ts handoff/lib.test.ts
+node --experimental-strip-types --test handoff/*.test.ts
 ```
 
 One invariant the tests pin: the switch to the new session fires

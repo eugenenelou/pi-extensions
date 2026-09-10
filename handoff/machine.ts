@@ -11,7 +11,6 @@ import {
 } from "./lib.ts";
 
 export type Phase = "idle" | "armed" | "writing" | "switching";
-type RunMode = "session" | "file";
 
 /** What the new session must accept from the machine. */
 export interface NextSession {
@@ -80,7 +79,6 @@ export function headlessHost(host: Host, batonPath?: string): Host {
 }
 
 const CANCELLED = "Handoff cancelled; queued inputs restored to the editor";
-const FILE_CANCELLED = "Handoff file cancelled";
 
 export class HandoffMachine {
   phase: Phase = "idle";
@@ -92,7 +90,6 @@ export class HandoffMachine {
   private host: Host | undefined;
   /** A run started off the bus is invisible, so it must not steal typed inputs. */
   private capturing = true;
-  private mode: RunMode = "session";
 
   /** Extension `input` handler: true when the input was captured for the new session. */
   onInput(
@@ -107,7 +104,7 @@ export class HandoffMachine {
     if (!capture) return false;
     this.stash.push(text);
     if (this.host) {
-      this.host.setWidget(widgetLines(this.stash, this.phase, this.mode === "file"));
+      this.host.setWidget(widgetLines(this.stash, this.phase));
     }
     return true;
   }
@@ -119,32 +116,34 @@ export class HandoffMachine {
     this.activeRun = 0;
     this.host = undefined;
     this.capturing = true;
-    this.mode = "session";
     this.stash = [];
   }
 
   /** `/handoff` typed: starts a run, or cancels the one in progress. Returns at once. */
   command(host: Host, focus: string, goalActive = false): Promise<void> {
     if (this.phase !== "idle") {
-      this.cancel(this.mode === "file" ? FILE_CANCELLED : CANCELLED);
+      this.cancel(CANCELLED);
       return Promise.resolve();
     }
-    return this.start(host, focus, goalActive, true, "session");
-  }
-
-  /** `/handoff-file` typed: writes only, or cancels the one in progress. */
-  file(host: Host, focus: string): Promise<void> {
-    if (this.phase !== "idle") {
-      this.cancel(this.mode === "file" ? FILE_CANCELLED : CANCELLED);
-      return Promise.resolve();
-    }
-    return this.start(host, focus, false, false, "file");
+    return this.start(host, focus, goalActive, true);
   }
 
   /** Bus entry point: starts a run, and does nothing while one is in progress. */
   request(host: Host, focus: string, goalActive = false): Promise<void> {
     if (this.phase !== "idle") return Promise.resolve();
-    return this.start(host, focus, goalActive, false, "session");
+    return this.start(host, focus, goalActive, false);
+  }
+
+  /**
+   * Tree navigation: the run is dropped, whatever phase it is in.
+   *
+   * The conversation it was started from is no longer the branch, and pi aborts
+   * the running turn on its way there — which an armed run would otherwise read
+   * as the agent settling and hand off on.
+   */
+  onTreeNavigation(): void {
+    if (this.phase === "idle") return;
+    this.cancel("Handoff cancelled: navigating the session tree");
   }
 
   private start(
@@ -152,13 +151,11 @@ export class HandoffMachine {
     focus: string,
     goalActive: boolean,
     capturing: boolean,
-    mode: RunMode,
   ): Promise<void> {
     const run = ++this.nextRun;
     this.activeRun = run;
     this.host = host;
     this.capturing = capturing;
-    this.mode = mode;
     return this.run(host, focus, goalActive, run).catch((err) => {
       if (this.activeRun === run) {
         this.cancel(`Handoff failed: ${(err as Error).message ?? err}`);
@@ -168,11 +165,8 @@ export class HandoffMachine {
 
   private setPhase(host: Host, next: Phase): void {
     this.phase = next;
-    host.setWidget(
-      next === "idle" ? undefined : widgetLines(this.stash, next, this.mode === "file"),
-    );
+    host.setWidget(next === "idle" ? undefined : widgetLines(this.stash, next));
   }
-
 
   /** Every effect lands on the run's own host, whoever asked for the cancel. */
   private cancel(why: string): void {
@@ -183,7 +177,6 @@ export class HandoffMachine {
     this.activeRun = 0;
     this.host = undefined;
     this.capturing = true;
-    this.mode = "session";
     if (host) {
       host.setWidget(undefined);
       if (this.stash.length > 0) {
@@ -204,9 +197,7 @@ export class HandoffMachine {
     if (!host.isIdle()) {
       this.setPhase(host, "armed");
       host.notify(
-        this.mode === "file"
-          ? "Handoff file armed: runs when the agent settles"
-          : "Handoff armed: runs when the agent settles; Alt+Enter inputs go to the new session",
+        "Handoff armed: runs when the agent settles; Alt+Enter inputs go to the new session",
         "info",
       );
       await host.waitForIdle();
@@ -235,23 +226,13 @@ export class HandoffMachine {
     }
     if (this.activeRun !== run || this.phase !== "writing") return;
     if (handoff === null) {
-      this.cancel(this.mode === "file" ? FILE_CANCELLED : CANCELLED);
+      this.cancel(CANCELLED);
       return;
     }
     this.abort = undefined;
 
     const handoffPath = host.handoffPath();
     host.writeFile(handoffPath, `${handoff.trim()}\n`);
-    if (this.mode === "file") {
-      this.setPhase(host, "idle");
-      this.activeRun = 0;
-      this.host = undefined;
-      this.capturing = true;
-      this.mode = "session";
-      this.stash = [];
-      host.notify(`Handoff file written (${handoffPath})`, "info");
-      return;
-    }
 
     this.setPhase(host, "switching");
     const result = await host.newSession(async (next) => {
