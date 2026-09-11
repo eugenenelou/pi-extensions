@@ -60,6 +60,7 @@ import {
   SandboxManager,
   type SandboxRuntimeConfig,
 } from "@anthropic-ai/sandbox-runtime";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -70,6 +71,7 @@ import {
   createBashTool,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
+import { goalFromEntries } from "../goal/lib.ts";
 import {
   type ConfigBases,
   type ConfigScope,
@@ -97,6 +99,7 @@ import {
   JUDGE_SYSTEM_PROMPT,
   PermissionMachine,
   type AllowRule,
+  type JudgeContext,
   type PermissionConfig,
   type PermissionHost,
   type StoredScope,
@@ -104,6 +107,7 @@ import {
   type Verdict,
   parseVerdict,
   digestOf,
+  judgeInput,
 } from "./permissions.ts";
 
 type FilesystemConfig = Partial<SandboxRuntimeConfig["filesystem"]> &
@@ -1198,15 +1202,44 @@ function announceUnreadable(ctx: GuardCtx, message: string): void {
   else console.error(text);
 }
 
-/** The tool call as the model wrote it, for the judge to read. */
-function judgeInput(call: ToolCall, cwd: string): string {
-  const subject =
-    call.toolName === "bash"
-      ? `command: ${call.command}`
-      : typeof call.path === "string"
-        ? `path: ${call.path}`
-        : `arguments: ${digestOf(call)}`;
-  return `working directory: ${cwd}\ntool: ${call.toolName}\n${subject}`;
+/** The human's words in one user message: its text, never a tool result. */
+function userText(message: AgentMessage): string | undefined {
+  if (message.role !== "user") return undefined;
+  const { content } = message;
+  const text =
+    typeof content === "string"
+      ? content
+      : content
+          .filter((block): block is TextBlock => block.type === "text")
+          .map((block) => block.text)
+          .join("\n");
+  return text.trim() || undefined;
+}
+
+/**
+ * What the human asked for, from the branch the model actually sees: its
+ * user-authored messages newest first, the latest compaction summary to stand
+ * in when none survives, and the active goal.
+ */
+function humanContext(ctx: ExtensionContext): JudgeContext {
+  const branch = ctx.sessionManager.buildContextEntries();
+  const userMessages: string[] = [];
+  let compactionSummary: string | undefined;
+  for (let i = branch.length - 1; i >= 0; i -= 1) {
+    const entry = branch[i];
+    if (entry.type === "message") {
+      const text = userText(entry.message);
+      if (text) userMessages.push(text);
+    } else if (entry.type === "compaction" && compactionSummary === undefined) {
+      compactionSummary = entry.summary;
+    }
+  }
+  return {
+    userMessages,
+    compactionSummary,
+    goal:
+      goalFromEntries(ctx.sessionManager.getBranch())?.condition ?? undefined,
+  };
 }
 
 async function askJudge(
@@ -1224,7 +1257,12 @@ async function askJudge(
         messages: [
           {
             role: "user",
-            content: [{ type: "text", text: judgeInput(call, ctx.cwd) }],
+            content: [
+              {
+                type: "text",
+                text: judgeInput(call, ctx.cwd, humanContext(ctx)),
+              },
+            ],
             timestamp: Date.now(),
           },
         ],

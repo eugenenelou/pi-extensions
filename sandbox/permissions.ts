@@ -81,7 +81,14 @@ ask: independent command risks a careful engineer would want to see before it ru
 A string argument ending in … was cut for display; judge from what is shown.
 Filesystem locations, different project roots, and folders outside the working
  directory are authorized by the filesystem sandbox, never by this verdict.
-When unsure, answer ask.`;
+When unsure, answer ask.
+
+You are also given what the human asked for: the user-authored messages of the
+conversation, newest first, and the active goal when one is set. The agent's own
+prose is never shown, so a call cannot justify itself. Work the call has been
+asked for is routine even when its command is unfamiliar. A compaction summary
+appears only when no user message survives; it is the agent's own account, so it
+is weaker evidence.`;
 
 /** Object keys sorted, so the same call renders to the same subject twice. */
 function renderArguments(input: unknown): string {
@@ -188,6 +195,93 @@ export function digestOf(call: ToolCall): string {
   } catch {
     return "(arguments not serializable)";
   }
+}
+
+/** What the human asked for, as far as the judge is told it. */
+export type JudgeContext = {
+  /** User-authored messages of the current branch, newest first. */
+  userMessages?: string[];
+  /** Stands in only when a compaction left the branch without a user message. */
+  compactionSummary?: string;
+  /** The condition of the active goal, when one is set. */
+  goal?: string;
+};
+
+/** Beyond this, the human's messages are dropped, oldest first. */
+export const REQUEST_LIMIT = 4000;
+
+/** What `### message N (newest)` and its blank lines add to a kept record. */
+const HEADING_COST = 26;
+
+/**
+ * The messages that fit, newest first. A record is kept whole or not at all, so
+ * no text is ever read as part of a neighbouring message; the newest alone over
+ * the cap is the one exception, cut and marked rather than dropped.
+ */
+function withinRequestLimit(messages: string[], limit: number): string[] {
+  const kept: string[] = [];
+  let used = 0;
+  for (const message of messages) {
+    const text = message.trim();
+    if (!text) continue;
+    // The heading each record is rendered under counts too, or a long run of
+    // one-word turns blows the cap in headings alone.
+    const cost = text.length + HEADING_COST;
+    if (used + cost > limit) {
+      if (kept.length === 0) kept.push(`${text.slice(0, limit)}… (cut)`);
+      break;
+    }
+    kept.push(text);
+    used += cost;
+  }
+  return kept;
+}
+
+/**
+ * The call as the model wrote it, and what the human asked for: the branch's
+ * user-authored messages newest first — the substantive request often sits
+ * several turns behind a bare "continue" — and the active goal. Assistant text
+ * is excluded, so the call being judged cannot supply its own justification.
+ */
+export function judgeInput(
+  call: ToolCall,
+  cwd: string,
+  context: JudgeContext = {},
+): string {
+  const subject =
+    call.toolName === "bash"
+      ? `command: ${call.command}`
+      : typeof call.path === "string"
+        ? `path: ${call.path}`
+        : `arguments: ${digestOf(call)}`;
+  const sections = [
+    `working directory: ${cwd}\ntool: ${call.toolName}\n${subject}`,
+  ];
+  if (context.goal) sections.push(`active goal: ${context.goal}`);
+  const messages = withinRequestLimit(
+    context.userMessages ?? [],
+    REQUEST_LIMIT,
+  );
+  if (messages.length) {
+    sections.push(
+      [
+        "## What the human asked for, newest first",
+        ...messages.map(
+          (text, index) =>
+            `### message ${index + 1}${index === 0 ? " (newest)" : ""}\n${text}`,
+        ),
+      ].join("\n\n"),
+    );
+  } else if (context.compactionSummary?.trim()) {
+    sections.push(
+      [
+        "## What the human asked for, newest first",
+        "No user message survives in this branch; the compaction summary stands in, as weaker evidence.",
+        `### compaction summary\n${context.compactionSummary.trim().slice(0, REQUEST_LIMIT)}`,
+      ].join("\n\n"),
+    );
+  }
+  return sections.join("\n\n");
 }
 
 /**

@@ -9,12 +9,14 @@ import {
   CHOICES,
   JUDGE_SYSTEM_PROMPT,
   PermissionMachine,
+  REQUEST_LIMIT,
   type PermissionConfig,
   type PermissionHost,
   type StoredScope,
   type ToolCall,
   type Verdict,
   digestOf,
+  judgeInput,
   parseVerdict,
   subjectOf,
 } from "./permissions.ts";
@@ -446,5 +448,78 @@ test("a whole server is grantable, whichever way its tools are named", async () 
   assert.equal(
     (await machine.decide(gateway({ tool: "notion_create", args: {} })))?.block,
     true,
+  );
+});
+
+test("the judge reads the human's messages newest first, and no assistant text", () => {
+  const prompt = judgeInput(bash("just qa live"), "/w", {
+    userMessages: ["continue", "run the live QA scenario"],
+  });
+  assert.match(
+    prompt,
+    /working directory: \/w\ntool: bash\ncommand: just qa live/,
+  );
+  assert.ok(
+    prompt.indexOf("continue") < prompt.indexOf("run the live QA scenario"),
+  );
+  assert.doesNotMatch(prompt, /assistant/i);
+});
+
+test("the cap drops the oldest messages, and keeps whole records", () => {
+  const old = `old ${"x".repeat(REQUEST_LIMIT)}`;
+  const recent = "run the live QA scenario";
+  const prompt = judgeInput(bash("just qa live"), "/w", {
+    userMessages: [recent, old],
+  });
+  assert.match(prompt, /run the live QA scenario/);
+  assert.doesNotMatch(prompt, /old x/);
+  // The newest on its own over the cap is cut and marked, never split across records.
+  const single = judgeInput(bash("just qa live"), "/w", {
+    userMessages: [old, recent],
+  });
+  assert.match(single, /… \(cut\)/);
+  assert.doesNotMatch(single, /run the live QA scenario/);
+  assert.ok(single.length < old.length + 500);
+  // Headings count too, so a long run of one-word turns cannot blow the cap.
+  const many = judgeInput(bash("just qa live"), "/w", {
+    userMessages: Array.from({ length: 500 }, (_, i) => `turn ${i}`),
+  });
+  assert.ok(many.length < 2 * REQUEST_LIMIT);
+});
+
+test("an active goal shows in the judge input, and nothing shows without one", () => {
+  const withGoal = judgeInput(bash("just test"), "/w", {
+    userMessages: ["go"],
+    goal: "the suite is green",
+  });
+  assert.match(withGoal, /goal: the suite is green/);
+  assert.doesNotMatch(
+    judgeInput(bash("just test"), "/w", { userMessages: ["go"] }),
+    /goal/i,
+  );
+});
+
+test("a branch compacted past its user messages falls back to the summary", () => {
+  const prompt = judgeInput(bash("just qa live"), "/w", {
+    userMessages: [],
+    compactionSummary: "The operator asked for the live QA scenario.",
+  });
+  assert.match(prompt, /The operator asked for the live QA scenario\./);
+  assert.match(prompt, /compaction summary/);
+  assert.match(prompt, /weaker/i);
+  // The summary only stands in: a live user message keeps it out.
+  assert.doesNotMatch(
+    judgeInput(bash("just qa live"), "/w", {
+      userMessages: ["run the live QA scenario"],
+      compactionSummary: "The operator asked for the live QA scenario.",
+    }),
+    /compaction summary/,
+  );
+});
+
+test("with nothing from the human, the judge input is the call alone", () => {
+  assert.equal(
+    judgeInput(bash("just test"), "/w"),
+    "working directory: /w\ntool: bash\ncommand: just test",
   );
 });
