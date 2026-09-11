@@ -35,7 +35,16 @@ export type ToolCall = {
   input?: unknown;
 };
 
-export type Verdict = { verdict: "allow" | "deny" | "ask"; reason?: string };
+export type Verdict = {
+  verdict: "allow" | "deny" | "ask";
+  reason?: string;
+  /**
+   * The generic rule the judge says would cover this call. Inert: it grants
+   * nothing in any scope, not even the session that produced it, so an
+   * identical call is judged again; only an operator accepting it makes a rule.
+   */
+  proposedRule?: AllowRule;
+};
 
 /** Where an allow granted from the dialog is remembered. */
 export type StoredScope = "worktree" | "global";
@@ -72,7 +81,8 @@ export const CHOICES = [
 export const JUDGE_SYSTEM_PROMPT = `You decide whether a coding agent may run a tool call.
 
 Answer with one JSON object and nothing else:
-{"verdict": "allow" | "deny" | "ask", "reason": "<one short sentence>"}
+{"verdict": "allow" | "deny" | "ask", "reason": "<one short sentence>",
+ "proposedRule": "<optional allow rule>"}
 
 allow: routine, reversible work.
 deny: destructive, irreversible work — data loss, credentials, publishing, or
@@ -88,7 +98,14 @@ conversation, newest first, and the active goal when one is set. The agent's own
 prose is never shown, so a call cannot justify itself. Work the call has been
 asked for is routine even when its command is unfamiliar. A compaction summary
 appears only when no user message survives; it is the agent's own account, so it
-is weaker evidence.`;
+is weaker evidence.
+
+proposedRule is optional and names the shape of call a human could reasonably
+approve once for all, as \`tool(pattern)\` — \`bash(just uv run python:*)\` rather
+than the command verbatim, a trailing \`:*\` reading as "this prefix, then
+anything". It grants nothing on its own: a human reviews and tightens it before
+it is ever in force, whatever the verdict. Omit it when no generic shape of this
+call would be safe to approve.`;
 
 /** Object keys sorted, so the same call renders to the same subject twice. */
 function renderArguments(input: unknown): string {
@@ -379,12 +396,25 @@ export function parseVerdict(text: string): Verdict {
   } catch {
     return { verdict: "ask", reason: "judge answered unparseable JSON" };
   }
-  const { verdict, reason } = (parsed ?? {}) as Record<string, unknown>;
+  const { verdict, reason, proposedRule } = (parsed ?? {}) as Record<
+    string,
+    unknown
+  >;
   const known = verdict === "allow" || verdict === "deny" || verdict === "ask";
+  const rule =
+    typeof proposedRule === "string" && proposedRule.trim()
+      ? proposedRule.trim()
+      : undefined;
   return {
     verdict: known ? verdict : "ask",
     reason: typeof reason === "string" ? reason : undefined,
+    ...(rule ? { proposedRule: rule } : {}),
   };
+}
+
+/** The rule travels with a refusal so the reader can accept it and retry. */
+function withProposedRule(reason: string, rule: AllowRule | undefined): string {
+  return rule ? `${reason}\nproposed rule: ${rule}` : reason;
 }
 
 export class PermissionMachine {
@@ -477,26 +507,33 @@ export class PermissionMachine {
     }
     if (this.allowed(call)) return undefined;
 
-    const { verdict, reason } = await this.judgeWithin(call);
+    const { verdict, reason, proposedRule } = await this.judgeWithin(call);
     if (verdict === "allow") return undefined;
     if (verdict === "deny") {
       return {
         block: true,
-        reason: `permission denied: ${reason ?? "judged unsafe"}`,
+        reason: withProposedRule(
+          `permission denied: ${reason ?? "judged unsafe"}`,
+          proposedRule,
+        ),
       };
     }
-    return this.ask(call, reason);
+    return this.ask(call, reason, proposedRule);
   }
 
   private async ask(
     call: ToolCall,
     reason: string | undefined,
+    proposedRule?: AllowRule,
   ): Promise<Block | undefined> {
     const why = reason ?? "not covered by the permission rules";
     if (!this.host.hasUI()) {
       return {
         block: true,
-        reason: `permission refused (nobody to ask): ${why}`,
+        reason: withProposedRule(
+          `permission refused (nobody to ask): ${why}`,
+          proposedRule,
+        ),
       };
     }
     const choice = await this.host.select(
@@ -524,6 +561,9 @@ export class PermissionMachine {
       }
       return undefined;
     }
-    return { block: true, reason: `permission refused: ${why}` };
+    return {
+      block: true,
+      reason: withProposedRule(`permission refused: ${why}`, proposedRule),
+    };
   }
 }

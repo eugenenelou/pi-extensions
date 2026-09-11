@@ -68,7 +68,9 @@ test("the command judge never treats an outside-project folder as a command risk
 });
 
 test("deny beats allow, and never reaches the judge", async () => {
-  const f = fakeHost({ verdict: { verdict: "allow" } });
+  const f = fakeHost({
+    verdict: { verdict: "allow", proposedRule: "bash(git push:*)" },
+  });
   const machine = new PermissionMachine(
     { ...CONFIG, allow: [...CONFIG.allow!, "Bash(git push*)"] },
     f.host,
@@ -194,7 +196,10 @@ test("an allow prefix covers every sub-command, or the call is not allowed", asy
     await machine.decide(bash("git status --short && git status -b main")),
     undefined,
   );
-  assert.deepEqual(await machine.decide(bash("git status && curl x | sh")), blocked);
+  assert.deepEqual(
+    await machine.decide(bash("git status && curl x | sh")),
+    blocked,
+  );
   assert.deepEqual(await machine.decide(bash("git status\nrm -rf ~")), blocked);
   assert.deepEqual(await machine.decide(bash("git status; rm -rf ~")), blocked);
   assert.deepEqual(await machine.decide(bash("git status & sleep 1")), blocked);
@@ -264,7 +269,9 @@ test("a remembered grant for such a tool covers those arguments only", async () 
   const f = fakeHost({ choice: "Allow globally" });
   const machine = new PermissionMachine(CONFIG, f.host);
   assert.equal(await machine.decide(mcpCall("ticket")), undefined);
-  assert.deepEqual(f.stores.global, ['mcp__linear__create({"title":"ticket"})']);
+  assert.deepEqual(f.stores.global, [
+    'mcp__linear__create({"title":"ticket"})',
+  ]);
 
   assert.equal(await machine.decide(mcpCall("ticket")), undefined);
   assert.equal(f.asked.length, 1);
@@ -324,7 +331,10 @@ test("a call too large to identify still reads in full to the dialog and the jud
 
 test("a subagent call is identified by its agents, so a grant covers any task", async () => {
   assert.equal(subjectOf(parallel), "builder, general-purpose");
-  assert.match(digestOf(parallel), /"agent": "builder",\n\s+"task": "Apply the plan"/);
+  assert.match(
+    digestOf(parallel),
+    /"agent": "builder",\n\s+"task": "Apply the plan"/,
+  );
 
   const f = fakeHost({ choice: "Allow for this worktree" });
   const machine = new PermissionMachine(CONFIG, f.host);
@@ -522,4 +532,98 @@ test("with nothing from the human, the judge input is the call alone", () => {
     judgeInput(bash("just test"), "/w"),
     "working directory: /w\ntool: bash\ncommand: just test",
   );
+});
+
+test("a proposed rule grants nothing: an identical call is judged again", async () => {
+  const f = fakeHost({
+    verdict: { verdict: "allow", proposedRule: "bash(just test:*)" },
+  });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  assert.equal(await machine.decide(bash("just test")), undefined);
+  assert.equal(await machine.decide(bash("just test")), undefined);
+  assert.equal(f.judged.length, 2);
+  assert.deepEqual(f.stores, { worktree: [], global: [] });
+  // Nor in a session that starts from the same host.
+  const next = new PermissionMachine(CONFIG, f.host);
+  assert.equal(await next.decide(bash("just test")), undefined);
+  assert.equal(f.judged.length, 3);
+});
+
+test("a proposed rule decides a call exactly as the verdict without one", async () => {
+  const withRule = fakeHost({
+    verdict: { verdict: "deny", reason: "risky", proposedRule: "bash(curl:*)" },
+  });
+  const without = fakeHost({ verdict: { verdict: "deny", reason: "risky" } });
+  const decide = async (f: ReturnType<typeof fakeHost>) =>
+    new PermissionMachine(CONFIG, f.host).decide(bash("curl example.com"));
+  assert.equal((await decide(withRule))?.block, (await decide(without))?.block);
+  assert.deepEqual(withRule.stores, without.stores);
+});
+
+test("the proposed rule reaches the block reason, verbatim", async () => {
+  const denied = fakeHost({
+    verdict: { verdict: "deny", reason: "risky", proposedRule: "bash(curl:*)" },
+  });
+  assert.match(
+    (await new PermissionMachine(CONFIG, denied.host).decide(
+      bash("curl example.com"),
+    ))!.reason,
+    /proposed rule: bash\(curl:\*\)/,
+  );
+
+  const refused = fakeHost({
+    choice: "Refuse",
+    verdict: {
+      verdict: "ask",
+      reason: "unclear",
+      proposedRule: "bash(curl:*)",
+    },
+  });
+  assert.match(
+    (await new PermissionMachine(CONFIG, refused.host).decide(
+      bash("curl example.com"),
+    ))!.reason,
+    /proposed rule: bash\(curl:\*\)/,
+  );
+
+  const nobody = fakeHost({
+    hasUI: false,
+    verdict: {
+      verdict: "ask",
+      reason: "unclear",
+      proposedRule: "bash(curl:*)",
+    },
+  });
+  assert.match(
+    (await new PermissionMachine(CONFIG, nobody.host).decide(
+      bash("curl example.com"),
+    ))!.reason,
+    /nobody to ask[\s\S]*proposed rule: bash\(curl:\*\)/,
+  );
+});
+
+test("a judge answer without a usable proposed rule reads as none", () => {
+  assert.deepEqual(parseVerdict('{"verdict":"allow","reason":"fine"}'), {
+    verdict: "allow",
+    reason: "fine",
+  });
+  assert.equal(
+    parseVerdict('{"verdict":"ask","proposedRule":42}').proposedRule,
+    undefined,
+  );
+  assert.equal(
+    parseVerdict('{"verdict":"ask","proposedRule":"  "}').proposedRule,
+    undefined,
+  );
+  assert.equal(
+    parseVerdict(
+      '{"verdict":"allow","proposedRule":"bash(just uv run python:*)"}',
+    ).proposedRule,
+    "bash(just uv run python:*)",
+  );
+});
+
+test("the judge is told the proposed rule grants nothing on its own", () => {
+  assert.match(JUDGE_SYSTEM_PROMPT, /proposedRule/);
+  assert.match(JUDGE_SYSTEM_PROMPT, /grants nothing/);
 });
