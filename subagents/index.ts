@@ -26,7 +26,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, discoverAgents } from "./agents.ts";
+import {
+  DEFAULT_AGENT_NAME,
+  type AgentConfig,
+  discoverAgents,
+} from "./agents.ts";
 import {
   executeSingleAgent,
   getFinalOutput,
@@ -274,13 +278,15 @@ export default function (pi: ExtensionAPI) {
     name: "subagent",
     label: "Subagent",
     description: [
-      "Delegate tasks to specialized subagents, each with its own isolated context and model.",
-      "Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+      "Delegate tasks to subagents, each with its own isolated context and model.",
+      "Modes: single (task, with optional agent), parallel (tasks array), chain (sequential with {previous} placeholder). An omitted single-mode agent uses the built-in default agent.",
       "Agents are defined in .pi/agents/*.md (project) and ~/.pi/agent/agents/*.md (user).",
     ].join(" "),
     parameters: SubagentParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      params.agent ??= DEFAULT_AGENT_NAME;
+
       const dispatchDefaults: DispatchDefaults = {
         model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
         thinkingLevel: ctx.thinkingLevel,
@@ -290,7 +296,7 @@ export default function (pi: ExtensionAPI) {
 
       const hasChain = (params.chain?.length ?? 0) > 0;
       const hasTasks = (params.tasks?.length ?? 0) > 0;
-      const hasSingle = Boolean(params.agent && params.task);
+      const hasSingle = Boolean(params.task);
       const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 
       const makeDetails =
@@ -338,11 +344,12 @@ export default function (pi: ExtensionAPI) {
               }
             : undefined;
 
+          const agentName = step.agent;
           const result = await runSingleAgent(
             ctx.cwd,
             dispatchDefaults,
             agents,
-            step.agent,
+            agentName,
             taskWithContext,
             step.cwd,
             i + 1,
@@ -358,7 +365,7 @@ export default function (pi: ExtensionAPI) {
               content: [
                 {
                   type: "text",
-                  text: `Chain stopped at step ${i + 1} (${step.agent}): ${truncateOutput(getResultOutput(result))}`,
+                  text: `Chain stopped at step ${i + 1} (${agentName}): ${truncateOutput(getResultOutput(result))}`,
                 },
               ],
               details: makeDetails("chain")(results),
@@ -476,7 +483,7 @@ export default function (pi: ExtensionAPI) {
         ctx.cwd,
         dispatchDefaults,
         agents,
-        params.agent as string,
+        params.agent,
         params.task as string,
         params.cwd,
         undefined,
@@ -550,7 +557,7 @@ export default function (pi: ExtensionAPI) {
           : args.task
         : "...";
       return new Text(
-        `${theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", args.agent || "...")}\n  ${theme.fg("dim", preview)}`,
+        `${theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", args.agent || DEFAULT_AGENT_NAME)}\n  ${theme.fg("dim", preview)}`,
         0,
         0,
       );

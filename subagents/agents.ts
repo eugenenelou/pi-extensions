@@ -17,6 +17,8 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 /** A Claude-style `.mcp.json` `mcpServers` map, already resolved (no `${VAR}`). */
 export type McpServers = Record<string, Record<string, unknown>>;
 
+export const DEFAULT_AGENT_NAME = "default";
+
 export interface AgentConfig {
 	name: string;
 	description: string;
@@ -25,9 +27,21 @@ export interface AgentConfig {
 	thinking?: ThinkingLevel;
 	mcpServers?: McpServers;
 	systemPrompt: string;
-	source: "user" | "project";
+	source: "builtin" | "user" | "project";
 	filePath: string;
 }
+
+const DEFAULT_AGENT: AgentConfig = {
+	name: DEFAULT_AGENT_NAME,
+	description: "General-purpose subagent with full capabilities and isolated context",
+	systemPrompt: [
+		"You are a general-purpose implementation subagent.",
+		"Inspect the relevant files and instructions, complete the assigned task, run appropriate checks, and report results concisely.",
+		"Preserve unrelated work and stop with a precise explanation if genuinely blocked.",
+	].join(" "),
+	source: "builtin",
+	filePath: "<builtin>",
+};
 
 export interface AgentDiscoveryResult {
 	agents: AgentConfig[];
@@ -163,7 +177,7 @@ export function discoverAgents(cwd: string): AgentDiscoveryResult {
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
 	const projectAgents = projectAgentsDir ? loadAgentsFromDir(projectAgentsDir, "project") : [];
 
-	const agentMap = new Map<string, AgentConfig>();
+	const agentMap = new Map<string, AgentConfig>([[DEFAULT_AGENT.name, DEFAULT_AGENT]]);
 	for (const agent of userAgents) agentMap.set(agent.name, agent);
 	for (const agent of projectAgents) agentMap.set(agent.name, agent);
 

@@ -126,12 +126,18 @@ Derived from pi-mono `examples/extensions/subagent/`, minus its `/implement`,
 
 ### Agent files
 
-Markdown with YAML frontmatter, discovered from:
+A built-in `default` agent provides general-purpose implementation behavior
+with all available tools, the parent model, and the parent thinking level. It is
+used whenever a single-mode invocation omits `agent`; a user or project agent
+named `default` can override it.
+
+Additional agents are Markdown with YAML frontmatter, discovered from:
 
 - `<cwd>/.pi/agents/*.md` — project (nearest `.pi/agents` walking up from cwd)
 - `~/.pi/agent/agents/*.md` — user
 
-Project agents shadow user agents with the same `name`. Both scopes are always
+Project agents shadow user agents with the same `name`, and both shadow the
+built-in default when named `default`. Both filesystem scopes are always
 searched; there is no `agentScope` parameter.
 
 ### Frontmatter contract
@@ -190,7 +196,7 @@ connected client receives `Child is no longer running.` for a later message.
 
 ### Modes
 
-- single: `{ agent, task, cwd? }`
+- single: `{ task, agent?, cwd? }`
 - parallel: `{ tasks: [{ agent, task, cwd? }] }` — max 8 tasks, 4 concurrent
 - chain: `{ chain: [{ agent, task }] }` — `{previous}` in a task is replaced by
   the previous step's final output; the chain stops on the first failure
