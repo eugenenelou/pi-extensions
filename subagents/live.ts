@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import * as net from "node:net";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 
 export type LiveChildRecord = {
   pid: number;
@@ -29,6 +30,20 @@ type PendingRequest = {
   resolve: (response: RpcResponse) => void;
   reject: (error: Error) => void;
 };
+
+function attachUtf8Reader(
+  stream: NodeJS.ReadableStream,
+  read: (chunk: string) => void,
+): void {
+  const decoder = new StringDecoder("utf8");
+  stream.on("data", (data: string | Buffer) =>
+    read(typeof data === "string" ? data : decoder.write(data)),
+  );
+  stream.on("end", () => {
+    const trailing = decoder.end();
+    if (trailing) read(trailing);
+  });
+}
 
 function registryDir(): string {
   return (
@@ -77,7 +92,8 @@ export class LiveChild {
     this.#parentSessionId = parentSessionId;
     this.#cwd = cwd;
     this.#onEvent = onEvent;
-    proc.stdout?.on("data", (data) => this.#read(data.toString()));
+    if (proc.stdout)
+      attachUtf8Reader(proc.stdout, (chunk) => this.#read(chunk));
     proc.on("close", () => this.#stop());
     proc.on("error", () => this.#stop());
   }
@@ -187,8 +203,8 @@ export class LiveChild {
   #observe(socket: net.Socket): void {
     this.#observers.add(socket);
     let buffer = "";
-    socket.on("data", (data) => {
-      buffer += data.toString();
+    attachUtf8Reader(socket, (chunk) => {
+      buffer += chunk;
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
       for (const line of lines) void this.#observerLine(socket, line);

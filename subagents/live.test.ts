@@ -4,14 +4,17 @@
  */
 
 import assert from "node:assert/strict";
-import { once } from "node:events";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter, once } from "node:events";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import type { AgentConfig } from "./agents.ts";
 import { runSingleAgent } from "./index.ts";
+import { LiveChild } from "./live.ts";
 
 type WireClient = {
   socket: net.Socket;
@@ -59,6 +62,50 @@ async function waitFor<T>(get: () => T | undefined): Promise<T> {
   }
   throw new Error("Timed out waiting for controlled child");
 }
+
+function splitInsideEmoji(value: Record<string, unknown>): [Buffer, Buffer] {
+  const bytes = Buffer.from(`${JSON.stringify(value)}\n`);
+  const splitAt = bytes.indexOf(Buffer.from("😀")) + 1;
+  assert.ok(splitAt > 0);
+  return [bytes.subarray(0, splitAt), bytes.subarray(splitAt)];
+}
+
+function liveServerSocket(port: number, clientPort: number): net.Socket | undefined {
+  const handles = (
+    process as NodeJS.Process & { _getActiveHandles(): unknown[] }
+  )._getActiveHandles();
+  return handles.find(
+    (handle): handle is net.Socket =>
+      handle instanceof net.Socket &&
+      handle.localPort === port &&
+      handle.remotePort === clientPort,
+  );
+}
+
+test("child RPC output preserves a multibyte character split across chunks", () => {
+  const stdout = new PassThrough();
+  const proc = Object.assign(new EventEmitter(), {
+    stdout,
+    stdin: new PassThrough(),
+    killed: false,
+    kill: () => true,
+  }) as unknown as ChildProcess;
+  const events: Record<string, unknown>[] = [];
+  const live = new LiveChild(proc, "parent-session", process.cwd(), (event) =>
+    events.push(event),
+  );
+  const expected = {
+    type: "message_end",
+    message: { role: "assistant", content: "before 😀 after" },
+  };
+  const [first, second] = splitInsideEmoji(expected);
+
+  stdout.write(first);
+  assert.deepEqual(events, []);
+  stdout.write(second);
+  assert.deepEqual(events, [expected]);
+  live.dispose();
+});
 
 test("a launched child is observed and steered through its one runtime", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-live-child-"));
@@ -174,26 +221,45 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     assert.equal(grandchildRecord.parentSessionId, "child-session");
     assert.equal(grandchildRecord.cwd, root);
 
-    const client = await connect(record.port as number);
+    const port = record.port as number;
+    const client = await connect(port);
     client.send({ type: "observe" });
     const snapshot = await client.next();
     assert.equal(snapshot.type, "snapshot");
     assert.match(JSON.stringify(snapshot), /initial output/);
     assert.match(JSON.stringify(snapshot), /tool output/);
 
-    client.send({ type: "message", id: "message-1", text: "change direction" });
-    assert.deepEqual(await client.next(), {
-      type: "response",
+    const serverSocket = await waitFor(() =>
+      liveServerSocket(port, client.socket.localPort!),
+    );
+    const [first, second] = splitInsideEmoji({
+      type: "message",
       id: "message-1",
-      success: true,
+      text: "before 😀 after",
     });
+    const bytesRead = serverSocket.bytesRead;
+    client.socket.write(first);
+    await waitFor(() =>
+      serverSocket.bytesRead >= bytesRead + first.length ? true : undefined,
+    );
+    client.socket.write(second);
+
     let sawInfluencedOutput = false;
+    let sawUtf8ClientMessage = false;
+    let sawMessageResponse = false;
     for (;;) {
       const update = await client.next();
       if (JSON.stringify(update).includes("influenced output"))
         sawInfluencedOutput = true;
+      if (JSON.stringify(update).includes('"content":"before 😀 after"'))
+        sawUtf8ClientMessage = true;
+      if (update.type === "response" && update.id === "message-1") {
+        assert.equal(update.success, true);
+        sawMessageResponse = true;
+      }
       if (update.type === "closed") break;
     }
+    assert.equal(sawMessageResponse, true);
     assert.equal(sawInfluencedOutput, true);
     client.send({ type: "message", id: "after-exit", text: "too late" });
     assert.deepEqual(await client.next(), {
@@ -240,6 +306,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     assert.equal(fs.existsSync(path.join(registryDir, registryFile)), false);
     assert.equal(fs.existsSync(path.join(registryDir, grandchildFile)), false);
     assert.deepEqual(fs.readdirSync(registryDir), []);
+    assert.equal(sawUtf8ClientMessage, true);
   } finally {
     process.argv[1] = originalArgv;
     if (originalRegistry === undefined) delete process.env.PI_SUBAGENT_REGISTRY_DIR;
