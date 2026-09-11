@@ -108,6 +108,9 @@ import {
   parseVerdict,
   digestOf,
   judgeInput,
+  answerWithin,
+  noHumanPresent,
+  SELECT_TIMEOUT_MS,
 } from "./permissions.ts";
 
 type FilesystemConfig = Partial<SandboxRuntimeConfig["filesystem"]> &
@@ -1354,8 +1357,19 @@ export default function (pi: ExtensionAPI) {
    * instead of capturing it.
    */
   let deciding: ExtensionContext | undefined;
+  const unattended = noHumanPresent(process.env, process.argv);
+  /** Every dialog of this extension: nobody to ask, or nobody answering, refuses. */
+  const askHuman = async (
+    ctx: GuardCtx,
+    message: string,
+    choices: string[],
+  ): Promise<string | undefined> =>
+    unattended || !ctx.hasUI
+      ? undefined
+      : (await answerWithin(ctx.ui.select(message, choices), SELECT_TIMEOUT_MS))
+          .value;
   const permissionHost: PermissionHost = {
-    hasUI: () => deciding?.hasUI ?? false,
+    canAsk: () => !unattended && (deciding?.hasUI ?? false),
     readRules: (scope) => {
       const cwd = deciding?.cwd ?? localCwd;
       return ruleFileConfig(localRulesPath(scope, cwd)).allow ?? [];
@@ -1525,10 +1539,10 @@ export default function (pi: ExtensionAPI) {
       });
       return { block: true, reason: message };
     }
-    const blocked =
-      !ctx.hasUI ||
-      (await ctx.ui.select(message, ["Block", "Allow once"])) !== "Allow once";
-    return blocked ? { block: true, reason: message } : undefined;
+    const choice = await askHuman(ctx, message, ["Block", "Allow once"]);
+    return choice === "Allow once"
+      ? undefined
+      : { block: true, reason: message };
   });
 
   pi.on("tool_execution_end", (event) => {

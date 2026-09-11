@@ -27,6 +27,7 @@ export interface ProcessHost {
     args: string[];
     cwd: string;
     parentSessionId: string;
+    env?: Record<string, string>;
   }): ExecutionChild;
 }
 
@@ -138,13 +139,13 @@ export const nodeProcessHost: ProcessHost = {
   createTempFile,
   removeTemp,
   resolveCwd: (defaultCwd, cwd) => path.resolve(defaultCwd, cwd ?? "."),
-  spawn({ args, cwd, parentSessionId }) {
+  spawn({ args, cwd, parentSessionId, env }) {
     const invocation = getPiInvocation(args);
     const proc = spawn(invocation.command, invocation.args, {
       cwd,
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, PI_SUBAGENT_PARENT_SESSION_ID: parentSessionId },
+      env: { ...process.env, ...env, PI_SUBAGENT_PARENT_SESSION_ID: parentSessionId },
     });
     return new NodeExecutionChild(proc, parentSessionId, cwd);
   },

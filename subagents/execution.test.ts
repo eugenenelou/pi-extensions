@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { NO_HUMAN_ENV } from "../sandbox/permissions.ts";
 import type { AgentConfig } from "./agents.ts";
 import {
   executeSingleAgent,
@@ -71,7 +72,7 @@ class FakeHost implements ProcessHost {
   readonly temporaryFiles: Array<{ prefix: string; name: string; content: string }> = [];
   readonly removed: string[] = [];
   spawnOptions:
-    | { args: string[]; cwd: string; parentSessionId: string }
+    | { args: string[]; cwd: string; parentSessionId: string; env?: Record<string, string> }
     | undefined;
 
   async createTempFile(prefix: string, name: string, content: string) {
@@ -88,7 +89,7 @@ class FakeHost implements ProcessHost {
     return `${defaultCwd}/${cwd ?? "."}`;
   }
 
-  spawn(options: { args: string[]; cwd: string; parentSessionId: string }): ExecutionChild {
+  spawn(options: { args: string[]; cwd: string; parentSessionId: string; env?: Record<string, string> }): ExecutionChild {
     this.spawnOptions = options;
     return this.child;
   }
@@ -143,6 +144,7 @@ test("execution host receives the configured child invocation and events become 
     ],
     cwd: "/project/nested",
     parentSessionId: "parent-session",
+    env: { [NO_HUMAN_ENV]: "1" },
   });
   assert.equal(host.child.startedTask, "do the work");
   assert.deepEqual(host.temporaryFiles.map((file) => file.content), [

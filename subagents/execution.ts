@@ -1,6 +1,7 @@
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentConfig, McpServers } from "./agents.ts";
+import { NO_HUMAN_ENV } from "../sandbox/permissions.ts";
 import { nodeProcessHost, type ExecutionChild, type ProcessHost } from "./process-host.ts";
 
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
@@ -225,6 +226,7 @@ export async function executeSingleAgent({
       args,
       cwd: host.resolveCwd(defaultCwd, cwd),
       parentSessionId,
+      env: { [NO_HUMAN_ENV]: "1" },
     });
     child.onEvent((event) => {
       if (event.type !== "message_end" || !event.message) return;

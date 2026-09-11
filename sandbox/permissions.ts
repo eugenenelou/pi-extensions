@@ -52,7 +52,8 @@ export type StoredScope = "worktree" | "global";
 export type Block = { block: true; reason: string };
 
 export interface PermissionHost {
-  hasUI(): boolean;
+  /** Whether a human can be asked; see `noHumanPresent`. */
+  canAsk(): boolean;
   readRules(scope: StoredScope): AllowRule[];
   writeRules(scope: StoredScope, rules: AllowRule[]): void;
   /** The judge model's verdict on a call neither list settled. */
@@ -63,6 +64,62 @@ export interface PermissionHost {
 
 /** A judge that has not answered within this is treated as unavailable. */
 export const JUDGE_TIMEOUT_MS = 30_000;
+
+/**
+ * A dialog nobody answers within this is a refusal. Only a backstop for a UI
+ * that fails to reach anyone: deciding on a permission legitimately takes
+ * minutes, so this must be far longer than any human deliberation, which is
+ * exactly why it cannot be the signal that nobody is there.
+ */
+export const SELECT_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * A dialog's answer, or `answered: false` once the wait is over. A dialog that
+ * fails reads as dismissed, not as unanswered: someone was there.
+ */
+export async function answerWithin<T>(
+  answer: Promise<T>,
+  ms: number,
+): Promise<{ answered: boolean; value?: T }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      answer.then(
+        (value) => ({ answered: true, value }),
+        () => ({ answered: true }),
+      ),
+      new Promise<{ answered: boolean }>((resolve) => {
+        timer = setTimeout(() => resolve({ answered: false }), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Set by the subagent launcher on its child; a loop carries CODASS_LOOP. */
+export const NO_HUMAN_ENV = "CODASS_NO_HUMAN";
+
+/**
+ * Whether this session has nobody to ask: a subagent child, a codass loop, or
+ * a print/json run. How the session was launched is the signal, never whether
+ * pi reports a UI — an RPC subagent reports one that reaches no one.
+ */
+export function noHumanPresent(
+  env: Record<string, string | undefined>,
+  argv: readonly string[],
+): boolean {
+  if (env[NO_HUMAN_ENV] === "1" || env.CODASS_LOOP) return true;
+  const flags = argv.slice(2);
+  const end = flags.indexOf("--");
+  const args = end === -1 ? flags : flags.slice(0, end);
+  return args.some(
+    (arg, index) =>
+      arg === "--print" ||
+      arg === "-p" ||
+      (arg === "--mode" && args[index + 1] === "json"),
+  );
+}
 
 /** Beyond this, arguments are too long to identify a call; nothing is remembered. */
 const ARGUMENTS_LIMIT = 2000;
@@ -424,15 +481,17 @@ export class PermissionMachine {
   private config: PermissionConfig;
   private host: PermissionHost;
   private judgeTimeoutMs: number;
+  private selectTimeoutMs: number;
 
   constructor(
     config: PermissionConfig,
     host: PermissionHost,
-    options: { judgeTimeoutMs?: number } = {},
+    options: { judgeTimeoutMs?: number; selectTimeoutMs?: number } = {},
   ) {
     this.config = config;
     this.host = host;
     this.judgeTimeoutMs = options.judgeTimeoutMs ?? JUDGE_TIMEOUT_MS;
+    this.selectTimeoutMs = options.selectTimeoutMs ?? SELECT_TIMEOUT_MS;
   }
 
   setConfig(config: PermissionConfig): void {
@@ -527,7 +586,7 @@ export class PermissionMachine {
     proposedRule?: AllowRule,
   ): Promise<Block | undefined> {
     const why = reason ?? "not covered by the permission rules";
-    if (!this.host.hasUI()) {
+    if (!this.host.canAsk()) {
       return {
         block: true,
         reason: withProposedRule(
@@ -536,10 +595,22 @@ export class PermissionMachine {
         ),
       };
     }
-    const choice = await this.host.select(
-      `${call.toolName}: ${digestOf(call)}\n${why}`,
-      [...CHOICES],
+    const answer = await answerWithin(
+      this.host.select(`${call.toolName}: ${digestOf(call)}\n${why}`, [
+        ...CHOICES,
+      ]),
+      this.selectTimeoutMs,
     );
+    if (!answer.answered) {
+      return {
+        block: true,
+        reason: withProposedRule(
+          `permission refused (dialog unanswered): ${why}`,
+          proposedRule,
+        ),
+      };
+    }
+    const choice = answer.value;
     if (choice === "Allow once") return undefined;
     if (
       choice === "Allow for this conversation" ||

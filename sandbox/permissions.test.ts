@@ -10,6 +10,7 @@ import {
   JUDGE_SYSTEM_PROMPT,
   PermissionMachine,
   REQUEST_LIMIT,
+  SELECT_TIMEOUT_MS,
   type PermissionConfig,
   type PermissionHost,
   type StoredScope,
@@ -17,6 +18,7 @@ import {
   type Verdict,
   digestOf,
   judgeInput,
+  noHumanPresent,
   parseVerdict,
   subjectOf,
 } from "./permissions.ts";
@@ -26,7 +28,7 @@ type Stores = Record<StoredScope, string[]>;
 /** A host recording what it was asked, with the stores kept in memory. */
 function fakeHost(
   opts: {
-    hasUI?: boolean;
+    canAsk?: boolean;
     verdict?: Verdict;
     choice?: string;
     stores?: Stores;
@@ -37,7 +39,7 @@ function fakeHost(
   const asked: string[][] = [];
   const messages: string[] = [];
   const host: PermissionHost = {
-    hasUI: () => opts.hasUI ?? true,
+    canAsk: () => opts.canAsk ?? true,
     readRules: (scope) => [...stores[scope]],
     writeRules: (scope, rules) => {
       stores[scope] = [...rules];
@@ -118,8 +120,8 @@ test("ask prompts with the five choices when a UI exists", async () => {
   assert.deepEqual(f.stores, { worktree: [], global: [] });
 });
 
-test("without a UI, ask is a refusal", async () => {
-  const f = fakeHost({ hasUI: false });
+test("with nobody to ask, ask is a refusal", async () => {
+  const f = fakeHost({ canAsk: false });
   const machine = new PermissionMachine(CONFIG, f.host);
   const blocked = await machine.decide(bash("just test"));
   assert.equal(blocked?.block, true);
@@ -232,7 +234,7 @@ test("a command that cannot be split safely is not allowed", async () => {
 });
 
 test("a judge that never answers times out into ask", async () => {
-  const f = fakeHost({ hasUI: false });
+  const f = fakeHost({ canAsk: false });
   f.host.judge = () => new Promise<Verdict>(() => {});
   const machine = new PermissionMachine(CONFIG, f.host, { judgeTimeoutMs: 10 });
   const blocked = await machine.decide(bash("just test"));
@@ -242,7 +244,7 @@ test("a judge that never answers times out into ask", async () => {
 });
 
 test("unreadable rules fail closed: no allow, no judge, the error is the reason", async () => {
-  const f = fakeHost({ hasUI: false, verdict: { verdict: "allow" } });
+  const f = fakeHost({ canAsk: false, verdict: { verdict: "allow" } });
   const machine = new PermissionMachine(
     { ...CONFIG, unreadable: "permissions.json: Unexpected token }" },
     f.host,
@@ -392,7 +394,7 @@ test("an auth action is not housekeeping, so `gateway/*` never grants it", async
     "auth/complete",
   );
 
-  const f = fakeHost({ hasUI: false });
+  const f = fakeHost({ canAsk: false });
   const machine = new PermissionMachine({ allow: ["mcp(gateway/*)"] }, f.host);
   assert.equal(
     await machine.decide(gateway({ connect: "playwright" })),
@@ -437,7 +439,7 @@ test("an mcp tool call is identified by its tool, so a grant covers any argument
 });
 
 test("a whole server is grantable, whichever way its tools are named", async () => {
-  const f = fakeHost({ hasUI: false });
+  const f = fakeHost({ canAsk: false });
   const machine = new PermissionMachine(
     { allow: ["mcp(playwright/*)", "mcp(playwright_*)"] },
     f.host,
@@ -587,7 +589,7 @@ test("the proposed rule reaches the block reason, verbatim", async () => {
   );
 
   const nobody = fakeHost({
-    hasUI: false,
+    canAsk: false,
     verdict: {
       verdict: "ask",
       reason: "unclear",
@@ -626,4 +628,66 @@ test("a judge answer without a usable proposed rule reads as none", () => {
 test("the judge is told the proposed rule grants nothing on its own", () => {
   assert.match(JUDGE_SYSTEM_PROMPT, /proposedRule/);
   assert.match(JUDGE_SYSTEM_PROMPT, /grants nothing/);
+});
+
+test("a marked session is the signal, not the UI flag", () => {
+  const interactive = { PATH: "/usr/bin" };
+  assert.equal(noHumanPresent(interactive, ["node", "pi"]), false);
+  assert.equal(
+    noHumanPresent(interactive, ["node", "pi", "--mode", "rpc"]),
+    false,
+  );
+  assert.equal(
+    noHumanPresent({ ...interactive, CODASS_NO_HUMAN: "1" }, [
+      "node",
+      "pi",
+      "--mode",
+      "rpc",
+    ]),
+    true,
+  );
+  assert.equal(
+    noHumanPresent({ ...interactive, CODASS_LOOP: "daily" }, ["node", "pi"]),
+    true,
+  );
+  assert.equal(
+    noHumanPresent(interactive, ["node", "pi", "-p", "hello"]),
+    true,
+  );
+  assert.equal(noHumanPresent(interactive, ["node", "pi", "--print"]), true);
+  assert.equal(
+    noHumanPresent(interactive, ["node", "pi", "--mode", "json"]),
+    true,
+  );
+});
+
+test("a marked session keeps both fixed lists", async () => {
+  const f = fakeHost({ canAsk: false, verdict: { verdict: "allow" } });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  assert.equal(await machine.decide(bash("git status --short")), undefined);
+  assert.equal(f.judged.length, 0);
+  assert.deepEqual(await machine.decide(bash("git push origin main")), {
+    block: true,
+    reason: "permission denied: git push",
+  });
+  assert.equal(f.asked.length, 0);
+});
+
+test("an unanswered dialog refuses through the backstop, which never rushes a human", async () => {
+  const f = fakeHost({
+    verdict: {
+      verdict: "ask",
+      reason: "unclear",
+      proposedRule: "bash(just:*)",
+    },
+  });
+  f.host.select = () => new Promise<string | undefined>(() => {});
+  const machine = new PermissionMachine(CONFIG, f.host, {
+    selectTimeoutMs: 10,
+  });
+  const blocked = await machine.decide(bash("just test"));
+  assert.equal(blocked?.block, true);
+  assert.match(blocked!.reason, /unanswered/);
+  assert.match(blocked!.reason, /proposed rule: bash\(just:\*\)/);
+  assert.ok(SELECT_TIMEOUT_MS >= 15 * 60_000);
 });
