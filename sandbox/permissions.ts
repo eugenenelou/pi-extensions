@@ -52,13 +52,42 @@ export type StoredScope = "worktree" | "global";
 /** A durable scope, or the session the grant dies with. */
 export type GrantScope = StoredScope | "conversation";
 
+/**
+ * A rule proposed where nobody could be asked, kept for review. Inert: it is
+ * recorded outside the allow lists the matcher reads, so an identical call is
+ * judged again; the layer is chosen when the operator accepts it, which is why
+ * the working directory the call came from is recorded with it.
+ */
+export type PendingProposal = {
+  rule: AllowRule;
+  /** The exact-subject rule for that call, when it could ever match again. */
+  verbatimRule?: AllowRule;
+  tool: string;
+  /** What the call did, as the reviewer reads it. */
+  command: string;
+  cwd: string;
+  verdict: "ask" | "deny";
+  /** ISO 8601. */
+  at: string;
+};
+
 export type Block = { block: true; reason: string };
 
 export interface PermissionHost {
   /** Whether a human can be asked; see `noHumanPresent`. */
   canAsk(): boolean;
+  /** Where the call being decided runs; recorded with a pending proposal. */
+  cwd(): string;
   readRules(scope: StoredScope): AllowRule[];
-  writeRules(scope: StoredScope, rules: AllowRule[]): void;
+  addRule(
+    scope: StoredScope,
+    rule: AllowRule,
+    targetCwd?: string,
+  ): void | Promise<void>;
+  /** The machine-wide pending list, which no matcher reads. */
+  readPending(): PendingProposal[];
+  addPending(proposal: PendingProposal): void | Promise<void>;
+  removePending(proposal: PendingProposal): void | Promise<void>;
   /** The judge model's verdict on a call neither list settled. */
   judge(call: ToolCall, signal: AbortSignal): Promise<Verdict>;
   /** The dialog; the chosen label, or undefined when it was dismissed. */
@@ -618,6 +647,7 @@ export class PermissionMachine {
     const { verdict, reason, proposedRule } = await this.judgeWithin(call);
     if (verdict === "allow") return undefined;
     if (verdict === "deny") {
+      if (!this.host.canAsk()) await this.record(call, "deny", proposedRule);
       return {
         block: true,
         reason: withProposedRule(
@@ -636,6 +666,7 @@ export class PermissionMachine {
   ): Promise<Block | undefined> {
     const why = reason ?? "not covered by the permission rules";
     if (!this.host.canAsk()) {
+      await this.record(call, "ask", proposedRule);
       return {
         block: true,
         reason: withProposedRule(
@@ -651,6 +682,8 @@ export class PermissionMachine {
       this.selectTimeoutMs,
     );
     if (!answer.answered) {
+      // The UI reached nobody after all, so the proposal is reviewable too.
+      await this.record(call, "ask", proposedRule);
       return {
         block: true,
         reason: withProposedRule(
@@ -680,11 +713,22 @@ export class PermissionMachine {
     scope: GrantScope,
     proposedRule: AllowRule | undefined,
   ): Promise<undefined> {
-    const verbatim = matchableRuleFor(call);
-    const prefill = [...new Set([proposedRule, verbatim].filter(Boolean))].join(
-      "\n",
-    );
-    // Nothing specific enough to remember: the grant degrades to allow once.
+    await this.store(scope, [proposedRule, matchableRuleFor(call)]);
+    return undefined;
+  }
+
+  /**
+   * The only way a rule is written, whether the operator answered the dialog or
+   * accepted a pending proposal: the candidates are offered for tightening, and
+   * what comes back is validated before any file is touched. The rule stored,
+   * or undefined when the input left nothing usable.
+   */
+  private async store(
+    scope: GrantScope,
+    candidates: (AllowRule | undefined)[],
+    targetCwd?: string,
+  ): Promise<AllowRule | undefined> {
+    const prefill = [...new Set(candidates.filter(Boolean))].join("\n");
     if (!prefill) return undefined;
     const answer = await answerWithin(
       this.host.editRule(
@@ -697,12 +741,57 @@ export class PermissionMachine {
     if (!rule || !isAllowRule(rule)) return undefined;
     if (scope === "conversation") {
       if (!this.conversation.includes(rule)) this.conversation.push(rule);
-      return undefined;
+      return rule;
     }
-    const stored = this.host.readRules(scope);
-    if (!stored.includes(rule)) {
-      this.host.writeRules(scope, [...stored, rule]);
-    }
-    return undefined;
+    await this.host.addRule(scope, rule, targetCwd);
+    return rule;
+  }
+
+  /** What sessions nobody watched proposed, for the review command. */
+  pending(): PendingProposal[] {
+    return this.host.readPending();
+  }
+
+  /**
+   * The operator's acceptance: the dialog's own write path, into the layer they
+   * chose now rather than one fixed when the proposal was made. The rule
+   * stored, or undefined — an input left empty or dismissed keeps the proposal
+   * pending instead of losing it.
+   */
+  async accept(
+    proposal: PendingProposal,
+    scope: StoredScope,
+  ): Promise<AllowRule | undefined> {
+    const rule = await this.store(
+      scope,
+      [proposal.rule, proposal.verbatimRule],
+      proposal.cwd,
+    );
+    if (rule) await this.drop(proposal);
+    return rule;
+  }
+
+  async drop(proposal: PendingProposal): Promise<void> {
+    await this.host.removePending(proposal);
+  }
+
+  /** Recording is not granting: nothing here is ever read by `allowed`. */
+  private async record(
+    call: ToolCall,
+    verdict: "ask" | "deny",
+    rule: AllowRule | undefined,
+  ): Promise<void> {
+    if (!rule) return;
+    const verbatim = matchableRuleFor(call);
+    const entry: PendingProposal = {
+      rule,
+      ...(verbatim ? { verbatimRule: verbatim } : {}),
+      tool: call.toolName,
+      command: digestOf(call),
+      cwd: this.host.cwd(),
+      verdict,
+      at: new Date().toISOString(),
+    };
+    await this.host.addPending(entry);
   }
 }

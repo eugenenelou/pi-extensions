@@ -4,6 +4,17 @@
  */
 
 import assert from "node:assert/strict";
+import {
+  lstat,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import {
   CHOICES,
@@ -11,6 +22,7 @@ import {
   PermissionMachine,
   REQUEST_LIMIT,
   SELECT_TIMEOUT_MS,
+  type PendingProposal,
   type PermissionConfig,
   type PermissionHost,
   type StoredScope,
@@ -23,6 +35,11 @@ import {
   parseVerdict,
   subjectOf,
 } from "./permissions.ts";
+import {
+  addAllowRule,
+  addPendingProposal,
+  removePendingProposal,
+} from "./permission-rule-file.ts";
 
 type Stores = Record<StoredScope, string[]>;
 
@@ -35,19 +52,41 @@ function fakeHost(
     /** The operator at the rule input; by default they confirm the prefill. */
     edit?: (prefill: string) => string | undefined;
     stores?: Stores;
+    cwd?: string;
+    pending?: PendingProposal[];
   } = {},
 ) {
   const stores: Stores = opts.stores ?? { worktree: [], global: [] };
+  let pending: PendingProposal[] = opts.pending ?? [];
   const judged: ToolCall[] = [];
   const asked: string[][] = [];
   const messages: string[] = [];
   const prefills: string[] = [];
   const editMessages: string[] = [];
+  const ruleAdds: { scope: StoredScope; rule: string; cwd?: string }[] = [];
+  const samePending = (one: PendingProposal, other: PendingProposal) =>
+    one.rule === other.rule &&
+    one.tool === other.tool &&
+    one.command === other.command &&
+    one.cwd === other.cwd;
   const host: PermissionHost = {
     canAsk: () => opts.canAsk ?? true,
+    cwd: () => opts.cwd ?? "/work",
     readRules: (scope) => [...stores[scope]],
-    writeRules: (scope, rules) => {
-      stores[scope] = [...rules];
+    addRule: (scope, rule, cwd) => {
+      if (!stores[scope].includes(rule)) {
+        ruleAdds.push({ scope, rule, ...(cwd ? { cwd } : {}) });
+        stores[scope].push(rule);
+      }
+    },
+    readPending: () => [...pending],
+    addPending: (proposal) => {
+      if (!pending.some((known) => samePending(known, proposal))) {
+        pending.push(proposal);
+      }
+    },
+    removePending: (proposal) => {
+      pending = pending.filter((entry) => !samePending(entry, proposal));
     },
     judge: async (call) => {
       judged.push(call);
@@ -64,7 +103,17 @@ function fakeHost(
       return opts.edit ? opts.edit(prefill) : prefill;
     },
   };
-  return { host, stores, judged, asked, messages, prefills, editMessages };
+  return {
+    host,
+    stores,
+    judged,
+    asked,
+    messages,
+    prefills,
+    editMessages,
+    ruleAdds,
+    pending: () => pending,
+  };
 }
 
 const CONFIG: PermissionConfig = {
@@ -705,23 +754,31 @@ test("an unanswered dialog refuses through the backstop, which never rushes a hu
 test("a durable scope stores the rule the operator confirms, not the command", async () => {
   const f = fakeHost({
     choice: "Allow globally",
-    verdict: { verdict: "ask", reason: "unclear", proposedRule: "bash(just:*)" },
+    verdict: {
+      verdict: "ask",
+      reason: "unclear",
+      proposedRule: "bash(just:*)",
+    },
     edit: () => "bash(just uv run python:*)",
   });
   const machine = new PermissionMachine(CONFIG, f.host);
-  assert.equal(await machine.decide(bash("just uv run python x.py")), undefined);
+  assert.equal(
+    await machine.decide(bash("just uv run python x.py")),
+    undefined,
+  );
   // The proposal is what the operator is handed, with the exact command under
   // it as the alternative for a call where nothing generic is safe.
-  assert.deepEqual(f.prefills, [
-    "bash(just:*)\nbash(just uv run python x.py)",
-  ]);
+  assert.deepEqual(f.prefills, ["bash(just:*)\nbash(just uv run python x.py)"]);
   assert.match(f.editMessages[0], /global/);
   assert.deepEqual(f.stores.global, ["bash(just uv run python:*)"]);
   assert.deepEqual(f.stores.worktree, []);
 
   // The stored shape decides the next call: the allow list, not the judge.
   const judgedBefore = f.judged.length;
-  assert.equal(await machine.decide(bash("just uv run python other.py")), undefined);
+  assert.equal(
+    await machine.decide(bash("just uv run python other.py")),
+    undefined,
+  );
   assert.equal(f.judged.length, judgedBefore);
   assert.equal(f.asked.length, 1);
 });
@@ -729,7 +786,11 @@ test("a durable scope stores the rule the operator confirms, not the command", a
 test("the verbatim choice stores the exact subject in the scope chosen", async () => {
   const f = fakeHost({
     choice: "Allow for this worktree",
-    verdict: { verdict: "ask", reason: "unclear", proposedRule: "bash(just:*)" },
+    verdict: {
+      verdict: "ask",
+      reason: "unclear",
+      proposedRule: "bash(just:*)",
+    },
     edit: (prefill) => prefill.split("\n")[1],
   });
   const machine = new PermissionMachine(CONFIG, f.host);
@@ -747,11 +808,9 @@ test("with no proposed rule the input is prefilled with the verbatim rule", asyn
 });
 
 test("an emptied, dismissed or unanswered input stores nothing and allows once", async () => {
-  for (const edit of [
-    () => "",
-    () => undefined,
-    () => "   \n  ",
-  ] as ((prefill: string) => string | undefined)[]) {
+  for (const edit of [() => "", () => undefined, () => "   \n  "] as ((
+    prefill: string,
+  ) => string | undefined)[]) {
     const f = fakeHost({ choice: "Allow globally", edit });
     const machine = new PermissionMachine(CONFIG, f.host);
     assert.equal(await machine.decide(bash("just test")), undefined);
@@ -770,7 +829,13 @@ test("an emptied, dismissed or unanswered input stores nothing and allows once",
 });
 
 test("a malformed pattern never reaches a rules file, nor a prefill", async () => {
-  for (const text of ["rm -rf ~", "bash()", "bash(foo", "(just:*)", "bash(*)"]) {
+  for (const text of [
+    "rm -rf ~",
+    "bash()",
+    "bash(foo",
+    "(just:*)",
+    "bash(*)",
+  ]) {
     assert.equal(isAllowRule(text), false, text);
     const f = fakeHost({ choice: "Allow globally", edit: () => text });
     assert.equal(
@@ -782,7 +847,8 @@ test("a malformed pattern never reaches a rules file, nor a prefill", async () =
   assert.equal(isAllowRule("bash(just uv run python:*)"), true);
   // The judge's own proposal is held to the same shape before it is shown.
   assert.equal(
-    parseVerdict('{"verdict":"ask","proposedRule":"anything goes"}').proposedRule,
+    parseVerdict('{"verdict":"ask","proposedRule":"anything goes"}')
+      .proposedRule,
     undefined,
   );
 });
@@ -797,7 +863,11 @@ test("a compound command is never offered as a rule it could not match", async (
 
   const proposed = fakeHost({
     choice: "Allow globally",
-    verdict: { verdict: "ask", reason: "unclear", proposedRule: "bash(just:*)" },
+    verdict: {
+      verdict: "ask",
+      reason: "unclear",
+      proposedRule: "bash(just:*)",
+    },
   });
   const next = new PermissionMachine(CONFIG, proposed.host);
   assert.equal(await next.decide(bash("cd /tmp && just test")), undefined);
@@ -814,16 +884,223 @@ test("a conversation grant is edited too, and a rule is never stored twice", asy
   assert.equal(await machine.decide(bash("just other")), undefined);
   assert.equal(f.asked.length, 1);
 
-  const globals = fakeHost({ choice: "Allow globally", edit: () => "bash(just:*)" });
-  const writes: string[][] = [];
-  const write = globals.host.writeRules;
-  globals.host.writeRules = (scope, rules) => {
-    writes.push([...rules]);
-    write(scope, rules);
-  };
+  const globals = fakeHost({
+    choice: "Allow globally",
+    edit: () => "bash(just:*)",
+  });
   const second = new PermissionMachine(CONFIG, globals.host);
   assert.equal(await second.decide(bash("curl a")), undefined);
   assert.equal(await second.decide(bash("curl b")), undefined);
   assert.deepEqual(globals.stores.global, ["bash(just:*)"]);
-  assert.equal(writes.length, 1);
+  assert.equal(globals.ruleAdds.length, 1);
+});
+
+test("a session nobody watched records what it was proposed, whatever the verdict", async () => {
+  for (const verdict of ["ask", "deny"] as const) {
+    const f = fakeHost({
+      canAsk: false,
+      cwd: "/work/bug_1",
+      verdict: { verdict, reason: "unclear", proposedRule: "bash(curl:*)" },
+    });
+    const machine = new PermissionMachine(CONFIG, f.host);
+    assert.equal((await machine.decide(bash("curl example.com")))?.block, true);
+    assert.deepEqual(
+      f.pending().map(({ at, ...entry }) => ({
+        ...entry,
+        dated: !Number.isNaN(Date.parse(at)),
+      })),
+      [
+        {
+          rule: "bash(curl:*)",
+          verbatimRule: "bash(curl example.com)",
+          tool: "bash",
+          command: "curl example.com",
+          cwd: "/work/bug_1",
+          verdict,
+          dated: true,
+        },
+      ],
+    );
+    assert.equal(f.asked.length, 0);
+  }
+});
+
+test("a pending proposal persists a triggering command over 2,000 characters in full", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "permissions-long-command-test-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, "permissions.local.json");
+  const command = `curl example.com/${"x".repeat(2_100)}`;
+  const f = fakeHost({
+    canAsk: false,
+    verdict: {
+      verdict: "ask",
+      reason: "unclear",
+      proposedRule: "bash(curl:*)",
+    },
+  });
+  f.host.addPending = (proposal) => addPendingProposal(file, proposal);
+
+  await new PermissionMachine(CONFIG, f.host).decide(bash(command));
+
+  const stored = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(stored.pending[0].command, command);
+});
+
+test("a dialog a human answers records nothing to review", async () => {
+  const f = fakeHost({
+    choice: "Refuse",
+    verdict: {
+      verdict: "ask",
+      reason: "unclear",
+      proposedRule: "bash(curl:*)",
+    },
+  });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  assert.equal((await machine.decide(bash("curl example.com")))?.block, true);
+  assert.deepEqual(f.pending(), []);
+});
+
+test("a recorded proposal grants nothing, and records once however often it recurs", async () => {
+  const f = fakeHost({
+    canAsk: false,
+    verdict: {
+      verdict: "ask",
+      reason: "unclear",
+      proposedRule: "bash(curl:*)",
+    },
+  });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  assert.equal((await machine.decide(bash("curl example.com")))?.block, true);
+  // A new session, reading the same recorded proposal, judges the call again.
+  const next = new PermissionMachine(CONFIG, f.host);
+  assert.equal((await next.decide(bash("curl example.com")))?.block, true);
+  assert.equal(f.judged.length, 2);
+  assert.equal(f.pending().length, 1);
+});
+
+test("concurrent rule-file updates preserve rules and pending proposals", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "permissions-test-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, "permissions.local.json");
+  const middle = join(dir, "operator-permissions.local.json");
+  const alias = join(dir, "profile-permissions.local.json");
+  await symlink(file, middle);
+  await symlink(middle, alias);
+  const proposals = Array.from({ length: 12 }, (_, index) => ({
+    rule: `bash(tool-${index}:*)`,
+    tool: "bash",
+    command: `tool-${index} value`,
+    cwd: `/work/${index}`,
+    verdict: "ask" as const,
+    at: `2026-09-11T12:00:${String(index).padStart(2, "0")}.000Z`,
+  }));
+
+  await Promise.all([
+    ...proposals.map((proposal, index) =>
+      addPendingProposal([file, middle, alias][index % 3], proposal),
+    ),
+    ...proposals.map((proposal, index) =>
+      addAllowRule([alias, file, middle][index % 3], proposal.rule),
+    ),
+  ]);
+  await Promise.all(proposals.map((proposal) => addPendingProposal(file, proposal)));
+  await removePendingProposal(file, proposals[0]);
+
+  assert.equal((await lstat(alias)).isSymbolicLink(), true);
+  assert.equal((await lstat(middle)).isSymbolicLink(), true);
+  const stored = JSON.parse(await readFile(file, "utf8"));
+  assert.deepEqual(new Set(stored.allow), new Set(proposals.map(({ rule }) => rule)));
+  assert.deepEqual(
+    new Set(stored.pending.map((proposal: PendingProposal) => proposal.rule)),
+    new Set(proposals.slice(1).map(({ rule }) => rule)),
+  );
+});
+
+test("a malformed rule file is never replaced", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "permissions-malformed-test-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, "permissions.local.json");
+  await writeFile(file, "{ broken");
+
+  await assert.rejects(addAllowRule(file, "bash(just:*)"), SyntaxError);
+  assert.equal(await readFile(file, "utf8"), "{ broken");
+});
+
+test("atomic rule-file replacements are mode 0600", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "permissions-mode-test-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, "permissions.local.json");
+
+  await addAllowRule(file, "bash(just:*)");
+
+  assert.equal((await stat(file)).mode & 0o777, 0o600);
+});
+
+test("accepting a worktree proposal stores it in the proposal cwd, not the review cwd", async () => {
+  const proposal: PendingProposal = {
+    rule: "bash(just:*)",
+    tool: "bash",
+    command: "just test",
+    cwd: "/work/proposal",
+    verdict: "ask",
+    at: "2026-09-11T12:00:00.000Z",
+  };
+  const f = fakeHost({ cwd: "/work/review", pending: [proposal] });
+  const machine = new PermissionMachine(CONFIG, f.host);
+
+  assert.equal(await machine.accept(proposal, "worktree"), "bash(just:*)");
+  assert.deepEqual(f.ruleAdds, [
+    { scope: "worktree", rule: "bash(just:*)", cwd: "/work/proposal" },
+  ]);
+  assert.deepEqual(f.pending(), []);
+});
+
+test("accepting a proposal takes the dialog's write path into the layer chosen then", async () => {
+  const f = fakeHost({
+    canAsk: false,
+    cwd: "/work/bug_1",
+    verdict: {
+      verdict: "ask",
+      reason: "unclear",
+      proposedRule: "bash(just:*)",
+    },
+    edit: () => "bash(just uv run python:*)",
+  });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  await machine.decide(bash("just uv run python x.py"));
+  const [proposal] = machine.pending();
+
+  assert.equal(
+    await machine.accept(proposal, "worktree"),
+    "bash(just uv run python:*)",
+  );
+  // The proposal and the exact command are offered for tightening, as in the
+  // dialog, and only what comes back out of the input is stored.
+  assert.deepEqual(f.prefills, ["bash(just:*)\nbash(just uv run python x.py)"]);
+  assert.match(f.editMessages[0], /worktree/);
+  assert.deepEqual(f.stores.worktree, ["bash(just uv run python:*)"]);
+  assert.deepEqual(f.stores.global, []);
+  assert.deepEqual(f.pending(), []);
+});
+
+test("a proposal survives an acceptance the operator leaves empty, and a drop ends it", async () => {
+  const f = fakeHost({
+    canAsk: false,
+    verdict: {
+      verdict: "ask",
+      reason: "unclear",
+      proposedRule: "bash(curl:*)",
+    },
+    edit: () => "",
+  });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  await machine.decide(bash("curl example.com"));
+  const [proposal] = machine.pending();
+
+  assert.equal(await machine.accept(proposal, "global"), undefined);
+  assert.deepEqual(f.stores.global, []);
+  assert.equal(f.pending().length, 1);
+
+  await machine.drop(proposal);
+  assert.deepEqual(f.pending(), []);
 });

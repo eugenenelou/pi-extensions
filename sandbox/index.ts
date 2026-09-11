@@ -100,6 +100,7 @@ import {
   PermissionMachine,
   type AllowRule,
   type JudgeContext,
+  type PendingProposal,
   type PermissionConfig,
   type PermissionHost,
   type StoredScope,
@@ -112,6 +113,11 @@ import {
   noHumanPresent,
   SELECT_TIMEOUT_MS,
 } from "./permissions.ts";
+import {
+  addAllowRule,
+  addPendingProposal,
+  removePendingProposal,
+} from "./permission-rule-file.ts";
 
 type FilesystemConfig = Partial<SandboxRuntimeConfig["filesystem"]> &
   FilesystemPolicyConfig & {
@@ -1167,9 +1173,33 @@ export function sandboxPathReason(
  * An unparseable file makes the machine fail closed, so it is reported rather
  * than skipped like an absent one.
  */
-function ruleFileConfig(file: string): PermissionConfig {
-  const doc = readConfig<PermissionConfig>(file);
+type LocalRuleFile = {
+  allow?: AllowRule[];
+  /** Machine-wide only: what unwatched sessions were proposed, for review. */
+  pending?: PendingProposal[];
+};
+
+function ruleFileConfig(file: string): LocalRuleFile {
+  const doc = readConfig<LocalRuleFile>(file);
   return doc.state === "present" ? doc.value : {};
+}
+
+function reviewRuleFile(
+  file: string,
+): { value: LocalRuleFile } | { error: string } {
+  try {
+    const value: unknown = JSON.parse(readFileSync(file, "utf8"));
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? { value: value as LocalRuleFile }
+      : { error: `${file}: not a JSON object` };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { value: {} };
+    }
+    return {
+      error: `${file}: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 }
 
 function loadPermissionConfig(cwd: string): PermissionConfig {
@@ -1187,6 +1217,32 @@ function loadPermissionConfig(cwd: string): PermissionConfig {
     allow: [...new Set(configs.flatMap((config) => config.allow ?? []))],
     unreadable: errors.length ? errors.join("; ") : undefined,
   };
+}
+
+const ACCEPT_CHOICES = new Map<string, StoredScope>([
+  ["Accept for this worktree", "worktree"],
+  ["Accept globally", "global"],
+]);
+
+const CLOSE_CHOICE = "Close";
+
+function oneLine(text: string, limit: number): string {
+  const line = text.replace(/\s+/g, " ").trim();
+  return line.length > limit ? `${line.slice(0, limit)}…` : line;
+}
+
+/** What the reviewer needs to judge a proposal without running anything. */
+function describeProposal(proposal: PendingProposal): string {
+  return [
+    proposal.rule,
+    `  ${proposal.tool}: ${proposal.command}`,
+    `  in ${proposal.cwd}`,
+    `  ${proposal.verdict} at ${proposal.at}`,
+  ].join("\n");
+}
+
+function proposalChoice(proposal: PendingProposal, index: number): string {
+  return `${index + 1}. ${proposal.rule} — ${oneLine(proposal.command, 60)}`;
 }
 
 function localRulesPath(scope: StoredScope, cwd: string): string {
@@ -1370,15 +1426,31 @@ export default function (pi: ExtensionAPI) {
           .value;
   const permissionHost: PermissionHost = {
     canAsk: () => !unattended && (deciding?.hasUI ?? false),
+    cwd: () => deciding?.cwd ?? localCwd,
     readRules: (scope) => {
       const cwd = deciding?.cwd ?? localCwd;
       return ruleFileConfig(localRulesPath(scope, cwd)).allow ?? [];
     },
-    writeRules: (scope, rules: AllowRule[]) => {
-      const path = localRulesPath(scope, deciding?.cwd ?? localCwd);
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, `${JSON.stringify({ allow: rules }, null, 2)}\n`);
-    },
+    addRule: (scope, rule, targetCwd) =>
+      addAllowRule(
+        localRulesPath(scope, targetCwd ?? deciding?.cwd ?? localCwd),
+        rule,
+      ),
+    // The machine-wide file, whichever worktree proposed the rule: the layer is
+    // chosen at acceptance, from the working directory recorded in the entry.
+    readPending: () =>
+      ruleFileConfig(localRulesPath("global", deciding?.cwd ?? localCwd))
+        .pending ?? [],
+    addPending: (proposal) =>
+      addPendingProposal(
+        localRulesPath("global", deciding?.cwd ?? localCwd),
+        proposal,
+      ),
+    removePending: (proposal) =>
+      removePendingProposal(
+        localRulesPath("global", deciding?.cwd ?? localCwd),
+        proposal,
+      ),
     judge: (call, signal) =>
       deciding
         ? askJudge(deciding, call, signal)
@@ -1728,6 +1800,74 @@ export default function (pi: ExtensionAPI) {
         // Ignore cleanup errors
       }
     }
+  });
+
+  /**
+   * The only door to a proposal recorded where nobody could be asked. It reads,
+   * accepts and drops; it decides nothing, and accepting goes through the same
+   * write path as the dialog, so a rule is still authored before it is in force.
+   */
+  pi.registerCommand("permissions", {
+    description: "Review the allow rules proposed where nobody could be asked",
+    handler: async (_args, ctx) => {
+      const pending = reviewRuleFile(localRulesPath("global", ctx.cwd));
+      if ("error" in pending) {
+        ctx.ui.notify(
+          `Could not read permission proposals: ${pending.error}`,
+          "error",
+        );
+        return;
+      }
+      const review = new PermissionMachine(
+        {},
+        {
+          ...permissionHost,
+          cwd: () => ctx.cwd,
+          select: (message, choices) => ctx.ui.select(message, choices),
+          editRule: (message, prefill) => ctx.ui.editor(message, prefill),
+        },
+      );
+      const proposals = pending.value.pending ?? [];
+      if (!proposals.length) {
+        ctx.ui.notify("No permission proposals pending review", "info");
+        return;
+      }
+      ctx.ui.notify(
+        [
+          "Pending permission proposals:",
+          ...proposals.map(describeProposal),
+        ].join("\n\n"),
+        "info",
+      );
+      const choices = proposals.map(proposalChoice);
+      const picked = await askHuman(ctx, "Proposal to review", [
+        ...choices,
+        CLOSE_CHOICE,
+      ]);
+      const index = choices.indexOf(picked ?? "");
+      if (index === -1) return;
+      const proposal = proposals[index];
+      const action = await askHuman(ctx, describeProposal(proposal), [
+        ...ACCEPT_CHOICES.keys(),
+        "Drop",
+        CLOSE_CHOICE,
+      ]);
+      const scope = ACCEPT_CHOICES.get(action ?? "");
+      if (scope) {
+        const rule = await review.accept(proposal, scope);
+        ctx.ui.notify(
+          rule
+            ? `Stored ${rule} (${scope})`
+            : "Nothing stored; the proposal stays pending",
+          rule ? "info" : "warning",
+        );
+        return;
+      }
+      if (action === "Drop") {
+        await review.drop(proposal);
+        ctx.ui.notify("Proposal dropped", "info");
+      }
+    },
   });
 
   pi.registerCommand("sandbox", {
