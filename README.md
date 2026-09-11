@@ -164,7 +164,7 @@ mcpServers: # optional, Claude .mcp.json server shape, already resolved (no ${VA
 ### Child invocation
 
 ```
-pi --mode json -p --no-session -a \
+pi --mode rpc --no-session -a \
    [--model <provider/id>] [--thinking <level>] [--tools a,b,c] \
    [--append-system-prompt <tmpfile>] [--mcp-config <tmpfile>] "Task: <task>"
 ```
@@ -176,6 +176,17 @@ further children. Verified to depth 2.
 The child binary is resolved as pi's own entry script under the current runtime
 (`process.execPath <argv[1]>`), falling back to `pi` on `PATH` and then to
 `~/.local/share/pnpm/pi`.
+
+### Live children
+
+Each delegated child stays in its original RPC process. While it runs, its
+parent writes a private record under `~/.cache/codass/pi-subagents/` with the
+child session id, immediate parent session id, actual cwd, process id and a
+loopback port. A local JSONL client sends `{"type":"observe"}` to receive a
+history snapshot followed by conversation and tool events, or
+`{"type":"message","id":"...","text":"..."}` to steer that same child.
+The record disappears when the child settles, fails or is cancelled; an already
+connected client receives `Child is no longer running.` for a later message.
 
 ### Modes
 

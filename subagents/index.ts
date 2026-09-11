@@ -14,10 +14,7 @@
  * `.mcp.json`, and the parent session never loads those servers.
  */
 
-import { spawn } from "node:child_process";
-import * as fs from "node:fs";
 import * as os from "node:os";
-import * as path from "node:path";
 import type {
   AgentToolResult,
   ThinkingLevel,
@@ -26,16 +23,26 @@ import type { Message } from "@earendil-works/pi-ai";
 import {
   type ExtensionAPI,
   getMarkdownTheme,
-  withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type McpServers, discoverAgents } from "./agents.ts";
+import { type AgentConfig, discoverAgents } from "./agents.ts";
+import {
+  executeSingleAgent,
+  getFinalOutput,
+  getResultOutput,
+  isFailedResult,
+  truncateOutput,
+  type DispatchDefaults,
+  type OnUpdateCallback,
+  type SingleResult,
+  type SubagentDetails,
+} from "./execution.ts";
+import { LiveChild } from "./live.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
 function formatTokens(count: number): string {
   if (count < 1000) return count.toString();
@@ -148,77 +155,24 @@ function formatToolCall(
   }
 }
 
-interface UsageStats {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  cost: number;
-  contextTokens: number;
-  turns: number;
-}
-
-interface SingleResult {
-  agent: string;
-  agentSource: "user" | "project" | "unknown";
-  task: string;
-  exitCode: number;
-  messages: Message[];
-  stderr: string;
-  usage: UsageStats;
-  model?: string;
-  thinking?: string;
-  stopReason?: string;
-  errorMessage?: string;
-  step?: number;
-}
-
-interface SubagentDetails {
-  mode: "single" | "parallel" | "chain";
-  projectAgentsDir: string | null;
-  results: SingleResult[];
-}
-
-function getFinalOutput(messages: Message[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role === "assistant") {
-      for (const part of msg.content) {
-        if (part.type === "text") return part.text;
-      }
+async function mapWithConcurrencyLimit<TIn, TOut>(
+  items: TIn[],
+  concurrency: number,
+  fn: (item: TIn, index: number) => Promise<TOut>,
+): Promise<TOut[]> {
+  if (items.length === 0) return [];
+  const limit = Math.max(1, Math.min(concurrency, items.length));
+  const results: TOut[] = new Array(items.length);
+  let nextIndex = 0;
+  const workers = new Array(limit).fill(null).map(async () => {
+    while (true) {
+      const current = nextIndex++;
+      if (current >= items.length) return;
+      results[current] = await fn(items[current], current);
     }
-  }
-  return "";
-}
-
-function isFailedResult(result: SingleResult): boolean {
-  return (
-    result.exitCode !== 0 ||
-    result.stopReason === "error" ||
-    result.stopReason === "aborted"
-  );
-}
-
-function getResultOutput(result: SingleResult): string {
-  if (isFailedResult(result)) {
-    return (
-      result.errorMessage ||
-      result.stderr ||
-      getFinalOutput(result.messages) ||
-      "(no output)"
-    );
-  }
-  return getFinalOutput(result.messages) || "(no output)";
-}
-
-function truncateOutput(output: string): string {
-  const byteLength = Buffer.byteLength(output, "utf8");
-  if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
-
-  let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-  while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP)
-    truncated = truncated.slice(0, -1);
-  return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 type DisplayItem =
@@ -243,118 +197,7 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
   return items;
 }
 
-async function mapWithConcurrencyLimit<TIn, TOut>(
-  items: TIn[],
-  concurrency: number,
-  fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-  if (items.length === 0) return [];
-  const limit = Math.max(1, Math.min(concurrency, items.length));
-  const results: TOut[] = new Array(items.length);
-  let nextIndex = 0;
-  const workers = new Array(limit).fill(null).map(async () => {
-    while (true) {
-      const current = nextIndex++;
-      if (current >= items.length) return;
-      results[current] = await fn(items[current], current);
-    }
-  });
-  await Promise.all(workers);
-  return results;
-}
-
-/**
- * A child is short-lived and was handed these servers because it needs them:
- * connect during startup rather than paying the spawn inside the first tool
- * call. An explicit `lifecycle` in the agent's frontmatter wins.
- */
-function withEagerLifecycle(servers: McpServers): McpServers {
-  return Object.fromEntries(
-    Object.entries(servers).map(([name, entry]) => [
-      name,
-      entry.lifecycle ? entry : { ...entry, lifecycle: "eager" },
-    ]),
-  );
-}
-
-async function writeTempFile(
-  prefix: string,
-  name: string,
-  content: string,
-): Promise<{ dir: string; filePath: string }> {
-  const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), prefix));
-  const filePath = path.join(tmpDir, name.replace(/[^\w.-]+/g, "_"));
-  await withFileMutationQueue(filePath, async () => {
-    await fs.promises.writeFile(filePath, content, {
-      encoding: "utf-8",
-      mode: 0o600,
-    });
-  });
-  return { dir: tmpDir, filePath };
-}
-
-function removeTemp(dir: string | null, filePath: string | null): void {
-  if (filePath) {
-    try {
-      fs.unlinkSync(filePath);
-    } catch {
-      /* ignore */
-    }
-  }
-  if (dir) {
-    try {
-      fs.rmdirSync(dir);
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-function findPiOnDisk(): string | null {
-  const candidates = [
-    ...(process.env.PATH ?? "")
-      .split(path.delimiter)
-      .filter(Boolean)
-      .map((dir) => path.join(dir, "pi")),
-    path.join(os.homedir(), ".local", "share", "pnpm", "pi"),
-  ];
-  for (const candidate of candidates) {
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return candidate;
-    } catch {
-      /* keep looking */
-    }
-  }
-  return null;
-}
-
-/**
- * Re-run the current pi entry script under the same runtime when possible; the
- * `pi` shim is not always on the child's PATH.
- */
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-  const currentScript = process.argv[1];
-  const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-  if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-    return { command: process.execPath, args: [currentScript, ...args] };
-  }
-
-  const execName = path.basename(process.execPath).toLowerCase();
-  if (!/^(node|bun)(\.exe)?$/.test(execName))
-    return { command: process.execPath, args };
-
-  return { command: findPiOnDisk() ?? "pi", args };
-}
-
-type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
-
-interface DispatchDefaults {
-  model?: string;
-  thinkingLevel?: ThinkingLevel;
-}
-
-async function runSingleAgent(
+export async function runSingleAgent(
   defaultCwd: string,
   dispatchDefaults: DispatchDefaults,
   agents: AgentConfig[],
@@ -362,191 +205,24 @@ async function runSingleAgent(
   task: string,
   cwd: string | undefined,
   step: number | undefined,
+  parentSessionId: string,
   signal: AbortSignal | undefined,
   onUpdate: OnUpdateCallback | undefined,
   makeDetails: (results: SingleResult[]) => SubagentDetails,
 ): Promise<SingleResult> {
-  const agent = agents.find((a) => a.name === agentName);
-
-  if (!agent) {
-    const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-    return {
-      agent: agentName,
-      agentSource: "unknown",
-      task,
-      exitCode: 1,
-      messages: [],
-      stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
-      usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        cost: 0,
-        contextTokens: 0,
-        turns: 0,
-      },
-      step,
-    };
-  }
-
-  const args: string[] = ["--mode", "json", "-p", "--no-session", "-a"];
-  const model = agent.model ?? dispatchDefaults.model;
-  if (model) args.push("--model", model);
-  const thinking =
-    agent.thinking ??
-    (agent.model ? undefined : dispatchDefaults.thinkingLevel);
-  if (thinking) args.push("--thinking", thinking);
-  if (agent.tools && agent.tools.length > 0)
-    args.push("--tools", agent.tools.join(","));
-
-  let tmpPrompt: { dir: string; filePath: string } | null = null;
-  let tmpMcp: { dir: string; filePath: string } | null = null;
-
-  const currentResult: SingleResult = {
-    agent: agentName,
-    agentSource: agent.source,
+  return executeSingleAgent({
+    defaultCwd,
+    dispatchDefaults,
+    agents,
+    agentName,
     task,
-    exitCode: 0,
-    messages: [],
-    stderr: "",
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      cost: 0,
-      contextTokens: 0,
-      turns: 0,
-    },
-    model,
-    thinking,
+    cwd,
     step,
-  };
-
-  const emitUpdate = () => {
-    onUpdate?.({
-      content: [
-        {
-          type: "text",
-          text: getFinalOutput(currentResult.messages) || "(running...)",
-        },
-      ],
-      details: makeDetails([currentResult]),
-    });
-  };
-
-  try {
-    if (agent.systemPrompt.trim()) {
-      tmpPrompt = await writeTempFile(
-        "pi-subagent-",
-        `prompt-${agent.name}.md`,
-        agent.systemPrompt,
-      );
-      args.push("--append-system-prompt", tmpPrompt.filePath);
-    }
-
-    if (agent.mcpServers) {
-      tmpMcp = await writeTempFile(
-        "pi-subagent-mcp-",
-        `mcp-${agent.name}.json`,
-        JSON.stringify(
-          { mcpServers: withEagerLifecycle(agent.mcpServers) },
-          null,
-          2,
-        ),
-      );
-      args.push("--mcp-config", tmpMcp.filePath);
-    }
-
-    args.push(`Task: ${task}`);
-    let wasAborted = false;
-
-    const exitCode = await new Promise<number>((resolve) => {
-      const invocation = getPiInvocation(args);
-      const proc = spawn(invocation.command, invocation.args, {
-        cwd: cwd ?? defaultCwd,
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      let buffer = "";
-
-      const processLine = (line: string) => {
-        if (!line.trim()) return;
-        let event: any;
-        try {
-          event = JSON.parse(line);
-        } catch {
-          return;
-        }
-
-        if (event.type === "message_end" && event.message) {
-          const msg = event.message as Message;
-          currentResult.messages.push(msg);
-
-          if (msg.role === "assistant") {
-            currentResult.usage.turns++;
-            const usage = msg.usage;
-            if (usage) {
-              currentResult.usage.input += usage.input || 0;
-              currentResult.usage.output += usage.output || 0;
-              currentResult.usage.cacheRead += usage.cacheRead || 0;
-              currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-              currentResult.usage.cost += usage.cost?.total || 0;
-              currentResult.usage.contextTokens = usage.totalTokens || 0;
-            }
-            if (!currentResult.model && msg.model)
-              currentResult.model = msg.model;
-            if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-            if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-          }
-          emitUpdate();
-        }
-
-        if (event.type === "tool_result_end" && event.message) {
-          currentResult.messages.push(event.message as Message);
-          emitUpdate();
-        }
-      };
-
-      proc.stdout.on("data", (data) => {
-        buffer += data.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        for (const line of lines) processLine(line);
-      });
-
-      proc.stderr.on("data", (data) => {
-        currentResult.stderr += data.toString();
-      });
-
-      proc.on("close", (code) => {
-        if (buffer.trim()) processLine(buffer);
-        resolve(code ?? 0);
-      });
-
-      proc.on("error", () => resolve(1));
-
-      if (signal) {
-        const killProc = () => {
-          wasAborted = true;
-          proc.kill("SIGTERM");
-          setTimeout(() => {
-            if (!proc.killed) proc.kill("SIGKILL");
-          }, 5000);
-        };
-        if (signal.aborted) killProc();
-        else signal.addEventListener("abort", killProc, { once: true });
-      }
-    });
-
-    currentResult.exitCode = exitCode;
-    if (wasAborted) throw new Error("Subagent was aborted");
-    return currentResult;
-  } finally {
-    removeTemp(tmpPrompt?.dir ?? null, tmpPrompt?.filePath ?? null);
-    removeTemp(tmpMcp?.dir ?? null, tmpMcp?.filePath ?? null);
-  }
+    parentSessionId,
+    signal,
+    onUpdate,
+    makeDetails,
+  });
 }
 
 const TaskItem = Type.Object({
@@ -670,6 +346,7 @@ export default function (pi: ExtensionAPI) {
             taskWithContext,
             step.cwd,
             i + 1,
+            ctx.sessionManager.getSessionId(),
             signal,
             chainUpdate,
             makeDetails("chain"),
@@ -761,6 +438,7 @@ export default function (pi: ExtensionAPI) {
               t.task,
               t.cwd,
               undefined,
+              ctx.sessionManager.getSessionId(),
               signal,
               (partial) => {
                 if (partial.details?.results[0]) {
@@ -802,6 +480,7 @@ export default function (pi: ExtensionAPI) {
         params.task as string,
         params.cwd,
         undefined,
+        ctx.sessionManager.getSessionId(),
         signal,
         onUpdate,
         makeDetails("single"),
