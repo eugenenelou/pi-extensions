@@ -7,6 +7,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
+import { DELEGATED_POLICY_READY_TIMEOUT_MS } from "../sandbox/authorization.ts";
 
 export type LiveChildRecord = {
   pid: number;
@@ -16,6 +17,19 @@ export type LiveChildRecord = {
   port: number;
   startedAt: number;
   updatedAt: number;
+};
+
+export type ExtensionUiRequest = {
+  type: "extension_ui_request";
+  id: string;
+  method: string;
+  [key: string]: unknown;
+};
+
+export type ExtensionUiResponse = {
+  type: "extension_ui_response";
+  id: string;
+  [key: string]: unknown;
 };
 
 type RpcResponse = {
@@ -74,31 +88,52 @@ export class LiveChild {
   #events: Record<string, unknown>[] = [];
   #observers = new Set<net.Socket>();
   #pending = new Map<string, PendingRequest>();
+  #policyWaiters = new Set<(event: Record<string, unknown>) => void>();
+  #uiRequests = new Set<AbortController>();
   #buffer = "";
+  #policyBuffer = "";
   #nextRequest = 0;
   #running = true;
   #server: net.Server | undefined;
   #port: number | undefined;
   #registryFile: string | undefined;
   #onEvent: (event: Record<string, unknown>) => void;
+  #onUiRequest?: (
+    request: ExtensionUiRequest,
+    signal: AbortSignal,
+  ) => Promise<ExtensionUiResponse>;
 
   constructor(
     proc: ChildProcess,
     parentSessionId: string,
     cwd: string,
     onEvent: (event: Record<string, unknown>) => void,
+    onUiRequest?: (
+      request: ExtensionUiRequest,
+      signal: AbortSignal,
+    ) => Promise<ExtensionUiResponse>,
   ) {
     this.#proc = proc;
     this.#parentSessionId = parentSessionId;
     this.#cwd = cwd;
     this.#onEvent = onEvent;
+    this.#onUiRequest = onUiRequest;
     if (proc.stdout)
       attachUtf8Reader(proc.stdout, (chunk) => this.#read(chunk));
+    proc.stderr?.on("data", (data) => this.#readPolicy(data.toString()));
     proc.on("close", () => this.#stop());
     proc.on("error", () => this.#stop());
   }
 
   async start(task: string): Promise<void> {
+    const policy = await this.#waitForPolicy();
+    if (!policy.ready)
+      throw new Error(
+        String(
+          policy.reason ??
+            "Delegated Pi did not install its inherited permission policy.",
+        ),
+      );
     const state = await this.#request("get_state");
     const sessionId = (state.data as { sessionId?: unknown } | undefined)
       ?.sessionId;
@@ -107,7 +142,9 @@ export class LiveChild {
 
     const initial = await this.#request("prompt", { message: `Task: ${task}` });
     if (!initial.success)
-      throw new Error(initial.error ?? "Delegated Pi process rejected its task.");
+      throw new Error(
+        initial.error ?? "Delegated Pi process rejected its task.",
+      );
     if (!this.#running) return;
 
     const id = randomUUID();
@@ -126,6 +163,37 @@ export class LiveChild {
       port: this.#port!,
       startedAt: Date.now(),
       updatedAt: Date.now(),
+    });
+  }
+
+  async #waitForPolicy(): Promise<Record<string, unknown>> {
+    const existing = this.#events.find(
+      (event) => event.type === "codass_policy_ready",
+    );
+    if (existing) return existing;
+    if (!this.#running) {
+      return {
+        ready: false,
+        reason:
+          "Delegated Pi exited before installing its inherited permission policy.",
+      };
+    }
+    return new Promise((resolve) => {
+      const finish = (event: Record<string, unknown>) => {
+        clearTimeout(timer);
+        this.#policyWaiters.delete(finish);
+        resolve(event);
+      };
+      const timer = setTimeout(
+        () =>
+          finish({
+            ready: false,
+            reason:
+              "Delegated Pi did not acknowledge its inherited permission policy.",
+          }),
+        DELEGATED_POLICY_READY_TIMEOUT_MS,
+      );
+      this.#policyWaiters.add(finish);
     });
   }
 
@@ -151,6 +219,10 @@ export class LiveChild {
     } catch {
       return;
     }
+    if (value.type === "extension_ui_request" && typeof value.id === "string") {
+      void this.#forwardUi(value as ExtensionUiRequest);
+      return;
+    }
     if (value.type === "response") {
       const response = value as RpcResponse;
       const id = response.id;
@@ -163,23 +235,78 @@ export class LiveChild {
       }
       return;
     }
-    this.#events.push(value);
-    this.#onEvent(value);
-    this.#broadcast({ type: "event", event: value });
-    if (value.type === "agent_settled") this.#stop();
+    this.#event(value);
   }
 
-  #request(type: string, args: Record<string, unknown> = {}): Promise<RpcResponse> {
+  #readPolicy(chunk: string): void {
+    this.#policyBuffer += chunk;
+    const lines = this.#policyBuffer.split("\n");
+    this.#policyBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      try {
+        const event = JSON.parse(line) as Record<string, unknown>;
+        if (event.type === "codass_policy_ready") this.#event(event);
+      } catch {
+        // Normal stderr is handled by the execution host.
+      }
+    }
+  }
+
+  #event(event: Record<string, unknown>): void {
+    this.#events.push(event);
+    if (event.type === "codass_policy_ready") {
+      for (const finish of [...this.#policyWaiters]) finish(event);
+    }
+    this.#onEvent(event);
+    this.#broadcast({ type: "event", event });
+    if (event.type === "agent_settled") this.#stop();
+  }
+
+  async #forwardUi(request: ExtensionUiRequest): Promise<void> {
+    const controller = new AbortController();
+    this.#uiRequests.add(controller);
+    let response: ExtensionUiResponse;
+    try {
+      response = this.#onUiRequest
+        ? await this.#onUiRequest(request, controller.signal)
+        : { type: "extension_ui_response", id: request.id, cancelled: true };
+    } catch {
+      response = {
+        type: "extension_ui_response",
+        id: request.id,
+        cancelled: true,
+      };
+    } finally {
+      this.#uiRequests.delete(controller);
+    }
+    if (this.#running && this.#proc.stdin?.writable) {
+      this.#proc.stdin.write(
+        `${JSON.stringify({ ...response, type: "extension_ui_response", id: request.id })}\n`,
+      );
+    }
+  }
+
+  #request(
+    type: string,
+    args: Record<string, unknown> = {},
+  ): Promise<RpcResponse> {
     if (!this.#running || !this.#proc.stdin?.writable)
-      return Promise.resolve({ type: "response", success: false, error: "Child is no longer running." });
+      return Promise.resolve({
+        type: "response",
+        success: false,
+        error: "Child is no longer running.",
+      });
     const id = `live-${++this.#nextRequest}`;
     return new Promise<RpcResponse>((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
-      this.#proc.stdin!.write(`${JSON.stringify({ id, type, ...args })}\n`, (error) => {
-        if (!error) return;
-        this.#pending.delete(id);
-        reject(error);
-      });
+      this.#proc.stdin!.write(
+        `${JSON.stringify({ id, type, ...args })}\n`,
+        (error) => {
+          if (!error) return;
+          this.#pending.delete(id);
+          reject(error);
+        },
+      );
     });
   }
 
@@ -224,7 +351,11 @@ export class LiveChild {
       if (!this.#running) this.#send(socket, { type: "closed" });
       return;
     }
-    if (command.type !== "message" || typeof command.id !== "string" || typeof command.text !== "string")
+    if (
+      command.type !== "message" ||
+      typeof command.id !== "string" ||
+      typeof command.text !== "string"
+    )
       return;
     if (!this.#running) {
       this.#send(socket, {
@@ -244,7 +375,9 @@ export class LiveChild {
         type: "response",
         id: command.id,
         success: response.success,
-        ...(response.success ? {} : { error: response.error ?? "Child is no longer running." }),
+        ...(response.success
+          ? {}
+          : { error: response.error ?? "Child is no longer running." }),
       });
     } catch {
       this.#send(socket, {
@@ -270,8 +403,20 @@ export class LiveChild {
     if (this.#registryFile) fs.rmSync(this.#registryFile, { force: true });
     this.#broadcast({ type: "closed" });
     for (const pending of this.#pending.values())
-      pending.resolve({ type: "response", success: false, error: "Child is no longer running." });
+      pending.resolve({
+        type: "response",
+        success: false,
+        error: "Child is no longer running.",
+      });
     this.#pending.clear();
+    for (const controller of this.#uiRequests) controller.abort();
+    this.#uiRequests.clear();
+    for (const finish of [...this.#policyWaiters])
+      finish({
+        ready: false,
+        reason:
+          "Delegated Pi exited before installing its inherited permission policy.",
+      });
     // Leave current observers a brief opportunity to receive the required
     // post-exit response; the registry is already gone, so new access is not.
     setTimeout(() => this.dispose(), 1000).unref();

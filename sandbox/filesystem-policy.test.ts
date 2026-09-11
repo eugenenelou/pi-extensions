@@ -12,7 +12,7 @@ import {
   FilesystemPolicy,
   type FolderGrant,
 } from "./filesystem-policy.ts";
-import { mergeFilesystem } from "./index.ts";
+import { materializeFilesystem, mergeFilesystem } from "./index.ts";
 
 const roots: string[] = [];
 
@@ -127,6 +127,23 @@ test("a read/write grant permits both modes but explicit protection wins", () =>
     [{ root: f.allowed, mode: "read-write" }],
   );
   assert.equal(readProtected.evaluate("write", join(f.protectedChild, "new")).state, "protected");
+});
+
+test("an exact attached file read crosses only that file's read protection", () => {
+  const f = fixture();
+  const attached = join(f.protectedChild, "attached.txt");
+  const neighbor = join(f.protectedChild, "neighbor.txt");
+  const current = new FilesystemPolicy(
+    { denyRead: [f.root], protectedRead: [f.protectedChild], allowWrite: [] },
+    f.root,
+    [],
+    process.platform,
+    [{ path: attached }],
+  );
+  assert.equal(current.evaluate("read", attached).state, "allowed");
+  assert.equal(current.evaluate("read", neighbor).state, "protected");
+  assert.equal(current.evaluate("write", attached).state, "protected");
+  assert.equal(current.evaluateReadTree(f.protectedChild).state, "protected");
 });
 
 test("an existing denyWrite remains protected below a granted parent", () => {
@@ -280,6 +297,20 @@ test("execution policies add grants without mutating their shared base policy", 
   const execution = base.withGrants([{ root: f.allowed, mode: "read" }]);
   assert.equal(execution.evaluate("read", join(f.allowed, "a.txt")).state, "allowed");
   assert.equal(base.evaluate("read", join(f.allowed, "a.txt")).state, "missing");
+});
+
+test("materialized inherited paths keep the parent's roots after cwd changes", () => {
+  const f = fixture();
+  const materialized = materializeFilesystem(
+    { allowRead: ["allowed"], allowWrite: ["allowed"], denyWrite: ["allowed/locked"] },
+    f.root,
+  );
+  assert.deepEqual(materialized.allowRead, [f.allowed]);
+  assert.deepEqual(materialized.allowWrite, [f.allowed]);
+  assert.deepEqual(materialized.denyWrite, [join(f.allowed, "locked")]);
+  const child = new FilesystemPolicy(materialized, f.sibling);
+  assert.equal(child.evaluate("write", join(f.allowed, "file")).state, "allowed");
+  assert.equal(child.evaluate("write", join(f.sibling, "file")).state, "missing");
 });
 
 test("a project layer adds to the machine's allow lists rather than replacing them", () => {

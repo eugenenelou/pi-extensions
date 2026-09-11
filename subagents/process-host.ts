@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { LiveChild } from "./live.ts";
+import { LiveChild, type ExtensionUiRequest, type ExtensionUiResponse } from "./live.ts";
 
 export interface TempFile {
   dir: string;
@@ -16,7 +16,7 @@ export interface ExecutionChild {
   start(task: string): Promise<void>;
   waitForExit(): Promise<number>;
   terminate(signal: NodeJS.Signals): void;
-  isKilled(): boolean;
+  hasExited(): boolean;
 }
 
 export interface ProcessHost {
@@ -28,6 +28,10 @@ export interface ProcessHost {
     cwd: string;
     parentSessionId: string;
     env?: Record<string, string>;
+    onUiRequest?: (
+      request: ExtensionUiRequest,
+      signal: AbortSignal,
+    ) => Promise<ExtensionUiResponse>;
   }): ExecutionChild;
 }
 
@@ -98,15 +102,31 @@ class NodeExecutionChild implements ExecutionChild {
   #live: LiveChild;
   #onEvent: ((event: Record<string, unknown>) => void) | undefined;
   #exit: Promise<number>;
+  #exited = false;
 
-  constructor(proc: ChildProcess, parentSessionId: string, cwd: string) {
+  constructor(
+    proc: ChildProcess,
+    parentSessionId: string,
+    cwd: string,
+    onUiRequest?: (
+      request: ExtensionUiRequest,
+      signal: AbortSignal,
+    ) => Promise<ExtensionUiResponse>,
+  ) {
     this.#proc = proc;
     this.#live = new LiveChild(proc, parentSessionId, cwd, (event) =>
       this.#onEvent?.(event),
+      onUiRequest,
     );
     this.#exit = new Promise<number>((resolve) => {
-      proc.on("close", (code) => resolve(code ?? 0));
-      proc.on("error", () => resolve(1));
+      proc.on("close", (code) => {
+        this.#exited = true;
+        resolve(code ?? 0);
+      });
+      proc.on("error", () => {
+        this.#exited = true;
+        resolve(1);
+      });
     });
   }
 
@@ -130,8 +150,8 @@ class NodeExecutionChild implements ExecutionChild {
     this.#proc.kill(signal);
   }
 
-  isKilled(): boolean {
-    return this.#proc.killed;
+  hasExited(): boolean {
+    return this.#exited;
   }
 }
 
@@ -139,7 +159,7 @@ export const nodeProcessHost: ProcessHost = {
   createTempFile,
   removeTemp,
   resolveCwd: (defaultCwd, cwd) => path.resolve(defaultCwd, cwd ?? "."),
-  spawn({ args, cwd, parentSessionId, env }) {
+  spawn({ args, cwd, parentSessionId, env, onUiRequest }) {
     const invocation = getPiInvocation(args);
     const proc = spawn(invocation.command, invocation.args, {
       cwd,
@@ -147,6 +167,6 @@ export const nodeProcessHost: ProcessHost = {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...env, PI_SUBAGENT_PARENT_SESSION_ID: parentSessionId },
     });
-    return new NodeExecutionChild(proc, parentSessionId, cwd);
+    return new NodeExecutionChild(proc, parentSessionId, cwd, onUiRequest);
   },
 };

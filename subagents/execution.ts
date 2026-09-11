@@ -1,7 +1,15 @@
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
-import type { AgentConfig, McpServers } from "./agents.ts";
-import { NO_HUMAN_ENV } from "../sandbox/permissions.ts";
+import type { AgentConfig } from "./agents.ts";
+import { FilesystemPolicy, resolveFilesystemPath } from "../sandbox/filesystem-policy.ts";
+import {
+  INHERITED_POLICY_ENV,
+  MAX_INHERITED_POLICY_BYTES,
+  makeDelegationRequest,
+  type DelegationAuthorization,
+  type EffectivePolicy,
+} from "../sandbox/authorization.ts";
+import type { ExtensionUiRequest, ExtensionUiResponse } from "./live.ts";
 import { nodeProcessHost, type ExecutionChild, type ProcessHost } from "./process-host.ts";
 
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
@@ -51,11 +59,28 @@ export interface SingleExecutionRequest {
   agentName: string;
   task: string;
   cwd?: string;
+  access?: "read" | "read-write";
   step?: number;
   parentSessionId: string;
   signal?: AbortSignal;
   onUpdate?: OnUpdateCallback;
   makeDetails: (results: SingleResult[]) => SubagentDetails;
+  effectivePolicy?: EffectivePolicy;
+  authorizeDelegation?: (
+    request: ReturnType<typeof makeDelegationRequest>,
+    signal?: AbortSignal,
+  ) => Promise<DelegationAuthorization | undefined>;
+  validateDelegation?: (
+    target: string,
+    access: "read" | "read-write",
+    authorization: DelegationAuthorization,
+  ) => boolean;
+  onUiRequest?: (
+    request: ExtensionUiRequest,
+    signal: AbortSignal,
+  ) => Promise<ExtensionUiResponse>;
+  /** Trusted user-installed extensions required to enforce and re-delegate. */
+  inheritedExtensionPaths?: string[];
   host?: ProcessHost;
 }
 
@@ -115,15 +140,6 @@ export function truncateOutput(output: string): string {
   return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
 }
 
-function withEagerLifecycle(servers: McpServers): McpServers {
-  return Object.fromEntries(
-    Object.entries(servers).map(([name, entry]) => [
-      name,
-      entry.lifecycle ? entry : { ...entry, lifecycle: "eager" },
-    ]),
-  );
-}
-
 /**
  * Executes one delegated child through the host boundary. The tool adapter owns
  * mode orchestration; this seam owns one process's configuration, event
@@ -136,11 +152,17 @@ export async function executeSingleAgent({
   agentName,
   task,
   cwd,
+  access = "read-write",
   step,
   parentSessionId,
   signal,
   onUpdate,
   makeDetails,
+  effectivePolicy,
+  authorizeDelegation,
+  validateDelegation,
+  onUiRequest,
+  inheritedExtensionPaths = [],
   host = nodeProcessHost,
 }: SingleExecutionRequest): Promise<SingleResult> {
   const agent = agents.find((candidate) => candidate.name === agentName);
@@ -159,18 +181,115 @@ export async function executeSingleAgent({
     };
   }
 
-  const args: string[] = ["--mode", "rpc", "--no-session", "-a"];
+  let targetCwd: string;
+  try {
+    targetCwd = resolveFilesystemPath(host.resolveCwd(defaultCwd, cwd));
+  } catch {
+    targetCwd = host.resolveCwd(defaultCwd, cwd);
+  }
+  const abortedResult = (): SingleResult => ({
+    agent: agentName,
+    agentSource: agent.source,
+    task,
+    exitCode: 1,
+    messages: [],
+    stderr: "Delegation cancelled before the child started.",
+    usage: emptyUsage(),
+    stopReason: "aborted",
+    step,
+  });
+  if (signal?.aborted) return abortedResult();
+
+  let authorization: DelegationAuthorization | undefined;
+  if (effectivePolicy) {
+    const policy = new FilesystemPolicy(
+      effectivePolicy.filesystem,
+      targetCwd,
+      effectivePolicy.grants,
+      process.platform,
+      effectivePolicy.exactReads,
+    );
+    // Delegation needs access to adopt this cwd, not blanket permission to
+    // traverse protected descendants; those restrictions remain in the child.
+    const read = policy.evaluate("read", targetCwd).state === "allowed";
+    const write = access === "read" || policy.evaluate("write", targetCwd).state === "allowed";
+    if (read && write) {
+      authorization = {
+        decision: { permission: "directory", duration: "run" },
+        policy: effectivePolicy,
+        projectTrusted: false,
+      };
+    } else if (authorizeDelegation) {
+      authorization = await authorizeDelegation(
+        makeDelegationRequest(
+          agentName,
+          targetCwd,
+          access,
+          `Keeps inherited restrictions and adds ${access} access only to ${targetCwd}.`,
+          `Replaces inherited permissions with the normal policy loaded from ${targetCwd}; it may grant access beyond that directory.`,
+        ),
+        signal,
+      );
+    }
+  }
+  if (signal?.aborted) return abortedResult();
+  if (
+    !authorization ||
+    (validateDelegation &&
+      !validateDelegation(targetCwd, access, authorization))
+  ) {
+    return {
+      agent: agentName,
+      agentSource: agent.source,
+      task,
+      exitCode: 1,
+      messages: [],
+      stderr: `Delegation permission refused for ${targetCwd}.`,
+      usage: emptyUsage(),
+      step,
+    };
+  }
+
+  if (signal?.aborted) return abortedResult();
+  const serializedPolicy = JSON.stringify(authorization.policy);
+  if (Buffer.byteLength(serializedPolicy, "utf8") > MAX_INHERITED_POLICY_BYTES) {
+    return {
+      agent: agentName,
+      agentSource: agent.source,
+      task,
+      exitCode: 1,
+      messages: [],
+      stderr: "Delegated permission policy is too large to hand off safely.",
+      usage: emptyUsage(),
+      step,
+    };
+  }
+
+  const args: string[] = ["--mode", "rpc", "--no-session"];
+  if (authorization.policy.toolMode !== "target-project") {
+    args.push("--no-approve");
+  }
+  for (const extension of inheritedExtensionPaths) {
+    args.push("--extension", extension);
+  }
   const model = agent.model ?? dispatchDefaults.model;
   if (model) args.push("--model", model);
   const thinking =
     agent.thinking ??
     (agent.model ? undefined : dispatchDefaults.thinkingLevel);
   if (thinking) args.push("--thinking", thinking);
-  if (agent.tools && agent.tools.length > 0)
-    args.push("--tools", agent.tools.join(","));
+  if (authorization.policy.toolMode === "target-project") {
+    // No CLI override: after explicit target-mode approval Pi loads exactly
+    // the active tool set of a directly opened session in that project. An
+    // agent file from the parent cannot activate or suppress target tools.
+  } else {
+    const requestedTools = agent.tools ?? authorization.policy.tools;
+    const tools = requestedTools.filter((tool) => authorization.policy.tools.includes(tool));
+    if (tools.length > 0) args.push("--tools", tools.join(","));
+    else args.push("--no-tools");
+  }
 
   let tmpPrompt: { dir: string; filePath: string } | undefined;
-  let tmpMcp: { dir: string; filePath: string } | undefined;
   let child: ExecutionChild | undefined;
   let wasAborted = false;
 
@@ -209,24 +328,24 @@ export async function executeSingleAgent({
       args.push("--append-system-prompt", tmpPrompt.filePath);
     }
 
-    if (agent.mcpServers) {
-      tmpMcp = await host.createTempFile(
-        "pi-subagent-mcp-",
-        `mcp-${agent.name}.json`,
-        JSON.stringify(
-          { mcpServers: withEagerLifecycle(agent.mcpServers) },
-          null,
-          2,
-        ),
-      );
-      args.push("--mcp-config", tmpMcp.filePath);
-    }
-
+    if (signal?.aborted) return abortedResult();
     child = host.spawn({
       args,
-      cwd: host.resolveCwd(defaultCwd, cwd),
+      cwd: targetCwd,
       parentSessionId,
-      env: { [NO_HUMAN_ENV]: "1" },
+      env: { [INHERITED_POLICY_ENV]: serializedPolicy },
+      onUiRequest: onUiRequest
+        ? (request, requestSignal) =>
+            onUiRequest(
+              {
+                ...request,
+                codassRequester: agentName,
+                codassTargetCwd: targetCwd,
+                codassParentSessionId: parentSessionId,
+              },
+              requestSignal,
+            )
+        : undefined,
     });
     child.onEvent((event) => {
       if (event.type !== "message_end" || !event.message) return;
@@ -253,12 +372,15 @@ export async function executeSingleAgent({
       currentResult.stderr += text;
     });
 
-    const abortChild = () => {
-      wasAborted = true;
+    const terminateChild = () => {
       child?.terminate("SIGTERM");
       setTimeout(() => {
-        if (child && !child.isKilled()) child.terminate("SIGKILL");
+        if (child && !child.hasExited()) child.terminate("SIGKILL");
       }, 5000).unref();
+    };
+    const abortChild = () => {
+      wasAborted = true;
+      terminateChild();
     };
     if (signal) {
       if (signal.aborted) abortChild();
@@ -268,14 +390,15 @@ export async function executeSingleAgent({
     try {
       await child.start(task);
     } catch (error) {
-      child.terminate("SIGTERM");
+      signal?.removeEventListener("abort", abortChild);
+      terminateChild();
       throw error;
     }
     currentResult.exitCode = await child.waitForExit();
+    signal?.removeEventListener("abort", abortChild);
     if (wasAborted) currentResult.stopReason = "aborted";
     return currentResult;
   } finally {
     if (tmpPrompt) host.removeTemp(tmpPrompt);
-    if (tmpMcp) host.removeTemp(tmpMcp);
   }
 }

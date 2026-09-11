@@ -148,11 +148,6 @@ description: one line
 tools: read, write, edit, bash, grep, find, ls, subagent # comma-separated pi tool names; absent = all tools
 model: openai-codex/gpt-5.6-terra # provider/id
 thinking: high # off|minimal|low|medium|high|xhigh|max
-mcpServers: # optional, Claude .mcp.json server shape, already resolved (no ${VAR})
-  linear:
-    command: uv
-    args: [...]
-    env: { LINEAR_API_TOKEN: "..." }
 ```
 
 - `name` and `description` are required; a file missing either is skipped.
@@ -160,8 +155,6 @@ mcpServers: # optional, Claude .mcp.json server shape, already resolved (no ${VA
 - `model` absent inherits the dispatching session's model; `thinking` absent
   inherits the dispatching session's thinking level only when `model` is also
   absent, so an agent that pins a model gets that model's default effort.
-- `mcpServers` also accepts a list of single-key maps, which is how codass emits
-  inline MCP servers.
 - Everything after the frontmatter is the child's system prompt. It is written
   to a 0600 temp file and passed as `--append-system-prompt <file>`, matching
   the upstream example: the child keeps pi's own system prompt and the agent
@@ -170,14 +163,29 @@ mcpServers: # optional, Claude .mcp.json server shape, already resolved (no ${VA
 ### Child invocation
 
 ```
-pi --mode rpc --no-session -a \
+pi --mode rpc --no-session [--no-approve] \
    [--model <provider/id>] [--thinking <level>] [--tools a,b,c] \
-   [--append-system-prompt <tmpfile>] [--mcp-config <tmpfile>] "Task: <task>"
+   [--append-system-prompt <tmpfile>] "Task: <task>"
 ```
 
-`-a` is what makes nesting work: the child trusts the same project
-`.pi/settings.json`, so it loads this extension too and its own agents can spawn
-further children. Verified to depth 2.
+Before any child process starts, delegation is checked against the parent's
+runtime filesystem policy. A target already in scope inherits that policy and
+starts with `--no-approve`, so changing cwd cannot load broader project config.
+For an out-of-scope cwd the user chooses either a read/read-write directory
+grant (the inherited policy plus that root) or the target project's normal
+policy (replacement, not a union). The latter uses a global `project_trust`
+hook to verify the approved project-resource fingerprint before Pi loads any
+target resource; it does not use `--approve`, which would bypass that hook.
+The effective policy is handed to the child before its first task and is
+inherited again by grandchildren.
+
+The `access` field on single, parallel, and chain entries is `read` or
+`read-write` (default). Approval may cover one child and its descendants or be
+remembered for matching launches in the current session and its delegation
+tree. Remembered approvals are inherited as latent, target-specific authority;
+they do not widen a child's active filesystem policy. Remembered target-mode
+approval includes a fingerprint of the approved target policy, so widening that
+policy asks again.
 
 The child binary is resolved as pi's own entry script under the current runtime
 (`process.execPath <argv[1]>`), falling back to `pi` on `PATH` and then to
@@ -196,9 +204,9 @@ connected client receives `Child is no longer running.` for a later message.
 
 ### Modes
 
-- single: `{ task, agent?, cwd? }`
-- parallel: `{ tasks: [{ agent, task, cwd? }] }` — max 8 tasks, 4 concurrent
-- chain: `{ chain: [{ agent, task }] }` — `{previous}` in a task is replaced by
+- single: `{ task, agent?, cwd?, access? }`
+- parallel: `{ tasks: [{ agent, task, cwd?, access? }] }` — max 8 tasks, 4 concurrent
+- chain: `{ chain: [{ agent, task, cwd?, access? }] }` — `{previous}` in a task is replaced by
   the previous step's final output; the chain stops on the first failure
 
 Each result carries the child's `model` and `thinking` in the tool `details` and
@@ -208,43 +216,11 @@ Progress streams through `onUpdate`. Every returned text is capped at 50 KB;
 the untruncated messages stay in the tool details. Aborting the tool (Ctrl+C)
 sends SIGTERM to the children, then SIGKILL after 5s.
 
-### Inline MCP servers
-
-An agent's `mcpServers` never reach `.mcp.json` and never load in the parent
-session. The parent writes `{"mcpServers": {...}}` to a 0600 temp file and
-passes it to the child as pi-mcp-adapter's own config flag:
-
-```
---mcp-config /tmp/pi-subagent-mcp-XXXX/mcp-<agent>.json
-```
-
-The flag is registered by pi-mcp-adapter, which the settings `packages` entry
-loads in the child; the adapter reads it straight off `process.argv`. Because
-the servers arrive as a config layer rather than a runtime registration, the
-child gets them with their `directTools` honoured — a `directTools: true`
-server is called as one direct tool instead of through the `mcp` proxy.
-
-The file replaces the adapter's _global_ layer (`~/.pi/agent/mcp.json`) and
-merges with everything else, project layers last, so a name that also exists in
-`.mcp.json` or `.pi/mcp.json` resolves to the project's definition. Do not set
-`PI_MCP_CONFIG_MODE=exclusive`: it makes the adapter ignore the flag entirely
-and keep only the real global file. The one thing a child with inline servers
-loses is the user-global `~/.pi/agent/mcp.json` layer, which the file stands in
-for.
-
-The argv is built per spawn, so a grandchild never inherits its grandparent's
-servers: nothing is put in the environment and nothing is forwarded.
-
-A definition without a `lifecycle` is written as `lifecycle: "eager"`: a child
-is short-lived and was handed the server because it needs it, so the adapter
-connects it during startup instead of spawning it inside the first tool call.
-An explicit `lifecycle` in the agent's `mcpServers` block wins.
-
-Direct tools are built at startup from the adapter's metadata cache
-(`~/.pi/agent/mcp-cache.json`, keyed by server name and definition hash). The
-first child to run a given server definition has no cache entry yet, so that
-run still goes through the `mcp` proxy and populates the cache; subsequent
-children get the direct tools.
+Agent frontmatter cannot start inline MCP servers: doing so would execute a
+repo-controlled command before the inherited command and filesystem policy can
+authorize it. In target-project mode, MCP resources that are part of the
+project's normal trusted Pi configuration load normally after explicit
+approval.
 
 ## `footer/`
 
@@ -439,10 +415,17 @@ A `tool_call` handler covers what the bash jail cannot:
   this guard is off with it.
 
 Command and `.env` guards prompt: with a UI the user picks `Block` or
-`Allow once`; without one (`--print`, `--mode json`) they block. Sandbox-path
-policy denials always block — a command approval cannot grant filesystem
-access. Folder access is supplied as a policy grant, rather than by this
-command-approval prompt.
+`Allow once`; without one (`--print`, `--mode json`) they block. Sandbox-path policy misses open a narrowly scoped filesystem prompt; explicit
+protections still block. The built-in `request_filesystem_access` tool provides
+the same user-owned route after a shell denial, without replaying the command.
+A command approval cannot grant filesystem access, and a filesystem approval
+cannot waive the independent command gate.
+
+An interactive `@path` file reference records an exact-file read capability for
+the conversation. It opens neither neighboring files nor writes, and this
+provenance is never inferred from RPC/subagent text, tool output, or quoted
+`<file>` markup. The exact capability and conversation folder grants inherit to
+subagents.
 
 ### Bash gate
 

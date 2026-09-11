@@ -18,6 +18,7 @@ import type {
 import {
   applyAllowRead,
   applyExecutionGrants,
+  applyExactFileReads,
   bootstrapAssets,
   dropMissingDevNullBinds,
   applyMacReadGrants,
@@ -190,6 +191,25 @@ test("execution grants rebind a denied folder after the jail's default hide", ()
     missingWrapped.includes(`--ro-bind /dev/null ${join(approved, "missing")}`),
     missingWrapped,
   );
+});
+
+test("an exact attached file is rebound after a protected parent and stays read-only", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-exact-file-"));
+  roots.push(root);
+  const protectedRoot = join(root, "protected");
+  const file = join(protectedRoot, "attached.txt");
+  mkdirSync(protectedRoot);
+  writeFileSync(file, "attached");
+  const wrapped = applyExactFileReads(
+    `bwrap --ro-bind / / --tmpfs ${protectedRoot} -- bash -c true`,
+    [{ path: file }],
+    root,
+  );
+  assert.ok(
+    wrapped.indexOf(`--ro-bind ${file} ${file}`) > wrapped.indexOf(`--tmpfs ${protectedRoot}`),
+    wrapped,
+  );
+  assert.equal(wrapped.includes(` --bind ${file} ${file}`), false);
 });
 
 test("a read/write grant remains writable after a normal read allow bind", () => {
@@ -471,6 +491,25 @@ test("macOS profiles append an exact read exception and retain protections", () 
       '(deny file-read* (regex "^/home/project/[^/]*\\\\.pem$"))',
     ),
     globProtected,
+  );
+  const exactRoot = mkdtempSync(join(tmpdir(), "pi-mac-exact-"));
+  roots.push(exactRoot);
+  const exactFile = join(exactRoot, "attached.txt");
+  writeFileSync(exactFile, "attached");
+  const exact = applyMacReadGrants(
+    command,
+    [],
+    "/",
+    [exactRoot],
+    "darwin",
+    [],
+    false,
+    [{ path: exactFile }],
+  );
+  assert.ok(
+    exact.indexOf(`(allow file-read* (literal ${JSON.stringify(exactFile)}))`) >
+      exact.indexOf(`(deny file-read* (subpath ${JSON.stringify(exactRoot)}))`),
+    exact,
   );
   const configuredVisible = applyMacReadGrants(command, [], "/", [], "darwin", [
     "/home/project",

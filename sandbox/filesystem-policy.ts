@@ -13,6 +13,8 @@ export type FolderAccess = "read" | "read-write";
 
 /** An exact recursive folder capability. */
 export type FolderGrant = { root: string; mode: FolderAccess };
+/** A user-supplied file: readable exactly, even through a read protection. */
+export type ExactFileRead = { path: string };
 
 export type AccessMode = "read" | "write";
 export type PolicyState = "allowed" | "missing" | "protected";
@@ -202,6 +204,7 @@ export class FilesystemPolicy {
   readonly #config: FilesystemPolicyConfig;
   readonly #cwd: string;
   readonly #grants: FolderGrant[];
+  readonly #exactReads: ExactFileRead[];
   readonly #platform: NodeJS.Platform;
 
   constructor(
@@ -209,10 +212,12 @@ export class FilesystemPolicy {
     cwd: string,
     grants: FolderGrant[] = [],
     platform: NodeJS.Platform = process.platform,
+    exactReads: ExactFileRead[] = [],
   ) {
     this.#config = config;
     this.#cwd = cwd;
     this.#grants = grants.map((grant) => ({ ...grant }));
+    this.#exactReads = exactReads.map((grant) => ({ ...grant }));
     this.#platform = platform;
   }
 
@@ -220,7 +225,7 @@ export class FilesystemPolicy {
     return new FilesystemPolicy(this.#config, this.#cwd, [
       ...this.#grants,
       ...grants,
-    ], this.#platform);
+    ], this.#platform, this.#exactReads);
   }
 
   /** Canonical grants suitable for the OS sandbox's allow lists. */
@@ -290,6 +295,18 @@ export class FilesystemPolicy {
         path: expandFilesystemPath(rawPath, this.#cwd),
       };
     }
+    const exactRead =
+      mode === "read" &&
+      this.#exactReads.some((entry) => {
+        try {
+          return resolveFilesystemPath(expandFilesystemPath(entry.path, this.#cwd)) === path;
+        } catch {
+          return false;
+        }
+      });
+    // Exact user attachment provenance is the only read capability narrower
+    // than a protection. It never grants traversal or writing.
+    if (exactRead) return { state: "allowed", path };
     if (
       mode === "write" &&
       isMandatoryWriteProtection(path, this.#config.allowGitConfig)

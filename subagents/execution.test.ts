@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { NO_HUMAN_ENV } from "../sandbox/permissions.ts";
+import { INHERITED_POLICY_ENV, type EffectivePolicy } from "../sandbox/authorization.ts";
 import type { AgentConfig } from "./agents.ts";
 import {
   executeSingleAgent,
@@ -11,13 +11,22 @@ import {
   type ProcessHost,
 } from "./execution.ts";
 
+const effectivePolicy: EffectivePolicy = {
+  version: 1,
+  sandbox: { enabled: true, filesystem: {} },
+  filesystem: {},
+  permissions: {},
+  tools: ["read", "bash"],
+  grants: [],
+  exactReads: [],
+};
+
 const agent: AgentConfig = {
   name: "worker",
   description: "test worker",
   source: "project",
   filePath: "/agents/worker.md",
   systemPrompt: "Follow the task.",
-  mcpServers: { helper: { command: "helper" } },
 };
 
 class FakeChild implements ExecutionChild {
@@ -28,6 +37,7 @@ class FakeChild implements ExecutionChild {
     this.#resolveExit = resolve;
   });
   terminated = false;
+  exited = false;
   startedTask: string | undefined;
 
   onEvent(listener: (event: Record<string, unknown>) => void): void {
@@ -50,8 +60,8 @@ class FakeChild implements ExecutionChild {
     this.terminated = true;
   }
 
-  isKilled(): boolean {
-    return this.terminated;
+  hasExited(): boolean {
+    return this.exited;
   }
 
   emit(event: Record<string, unknown>): void {
@@ -63,6 +73,7 @@ class FakeChild implements ExecutionChild {
   }
 
   exit(code: number): void {
+    this.exited = true;
     this.#resolveExit(code);
   }
 }
@@ -86,7 +97,7 @@ class FakeHost implements ProcessHost {
   }
 
   resolveCwd(defaultCwd: string, cwd: string | undefined): string {
-    return `${defaultCwd}/${cwd ?? "."}`;
+    return cwd?.startsWith("/") ? cwd : `${defaultCwd}/${cwd ?? "."}`;
   }
 
   spawn(options: { args: string[]; cwd: string; parentSessionId: string; env?: Record<string, string> }): ExecutionChild {
@@ -106,6 +117,7 @@ function request(host: ProcessHost, signal?: AbortSignal) {
     parentSessionId: "parent-session",
     signal,
     host,
+    effectivePolicy,
     makeDetails: (results) => ({ mode: "single", projectAgentsDir: null, results }),
   });
 }
@@ -122,6 +134,7 @@ test("execution host receives the configured child invocation and events become 
     cwd: "nested",
     parentSessionId: "parent-session",
     host,
+    effectivePolicy,
     onUpdate: (update) => updates.push((update.content[0] as { text: string }).text),
     makeDetails: (results) => ({ mode: "single", projectAgentsDir: null, results }),
   });
@@ -132,28 +145,24 @@ test("execution host receives the configured child invocation and events become 
       "--mode",
       "rpc",
       "--no-session",
-      "-a",
+      "--no-approve",
       "--model",
       "provider/default",
       "--thinking",
       "high",
+      "--tools",
+      "read,bash",
       "--append-system-prompt",
       "/tmp/prompt-worker.md",
-      "--mcp-config",
-      "/tmp/mcp-worker.json",
     ],
     cwd: "/project/nested",
     parentSessionId: "parent-session",
-    env: { [NO_HUMAN_ENV]: "1" },
+    env: { [INHERITED_POLICY_ENV]: JSON.stringify(effectivePolicy) },
+    onUiRequest: undefined,
   });
   assert.equal(host.child.startedTask, "do the work");
   assert.deepEqual(host.temporaryFiles.map((file) => file.content), [
     "Follow the task.",
-    JSON.stringify(
-      { mcpServers: { helper: { command: "helper", lifecycle: "eager" } } },
-      null,
-      2,
-    ),
   ]);
 
   host.child.stderr("child warning");
@@ -175,7 +184,7 @@ test("execution host receives the configured child invocation and events become 
   assert.equal(result.usage.turns, 1);
   assert.equal(result.usage.cost, 0.25);
   assert.deepEqual(updates, ["finished"]);
-  assert.deepEqual(host.removed, ["/tmp/prompt-worker.md", "/tmp/mcp-worker.json"]);
+  assert.deepEqual(host.removed, ["/tmp/prompt-worker.md"]);
 });
 
 test("aborting execution terminates the child and cleans up temporary resources", async () => {
@@ -190,7 +199,7 @@ test("aborting execution terminates the child and cleans up temporary resources"
 
   const result = await running;
   assert.equal(result.stopReason, "aborted");
-  assert.deepEqual(host.removed, ["/tmp/prompt-worker.md", "/tmp/mcp-worker.json"]);
+  assert.deepEqual(host.removed, ["/tmp/prompt-worker.md"]);
 });
 
 test("an aborted run returns the work accumulated before the abort", async () => {
@@ -230,6 +239,154 @@ test("an aborted run returns the work accumulated before the abort", async () =>
   assert.equal(result.usage.output, 12);
   assert.equal(result.usage.cost, 0.5);
   assert.equal(getResultOutput(result), "partial progress");
+});
+
+test("delegation outside inherited scope is refused before spawn without authorization", async () => {
+  const host = new FakeHost();
+  const restricted: EffectivePolicy = {
+    ...effectivePolicy,
+    filesystem: { denyRead: ["/"], allowWrite: ["/project"] },
+    sandbox: { enabled: true, filesystem: { denyRead: ["/"], allowWrite: ["/project"] } },
+  };
+  const result = await executeSingleAgent({
+    defaultCwd: "/project",
+    dispatchDefaults: {},
+    agents: [agent],
+    agentName: agent.name,
+    task: "outside",
+    cwd: "/other",
+    parentSessionId: "parent",
+    host,
+    effectivePolicy: restricted,
+    makeDetails: (results) => ({ mode: "single", projectAgentsDir: null, results }),
+  });
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /permission refused/);
+  assert.equal(host.spawnOptions, undefined);
+});
+
+test("approved target-project mode replaces the inherited policy and enables project resources", async () => {
+  const host = new FakeHost();
+  const restricted: EffectivePolicy = {
+    ...effectivePolicy,
+    filesystem: { denyRead: ["/other"], allowWrite: ["/project"] },
+  };
+  const target: EffectivePolicy = {
+    ...effectivePolicy,
+    filesystem: { allowWrite: ["/other"] },
+    permissions: { allow: ["bash(target-only:*)"] },
+    toolMode: "target-project",
+    targetProjectRoot: "/other",
+    projectResourcesFingerprint: "approved-resources",
+  };
+  let requested: unknown;
+  const running = executeSingleAgent({
+    defaultCwd: "/project",
+    dispatchDefaults: {},
+    agents: [{ ...agent, tools: ["read"] }],
+    agentName: agent.name,
+    task: "outside",
+    cwd: "/other",
+    parentSessionId: "parent",
+    host,
+    effectivePolicy: restricted,
+    authorizeDelegation: async (request) => {
+      requested = request;
+      return {
+        decision: { permission: "target-project", duration: "run" },
+        policy: target,
+        projectTrusted: true,
+      };
+    },
+    makeDetails: (results) => ({ mode: "single", projectAgentsDir: null, results }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((requested as { target: string }).target, "/other");
+  assert.equal((requested as { access: string }).access, "read-write");
+  assert.equal(host.spawnOptions?.args.includes("--approve"), false);
+  assert.equal(host.spawnOptions?.args.includes("--no-approve"), false);
+  assert.equal(host.spawnOptions?.args.includes("--tools"), false);
+  assert.deepEqual(
+    JSON.parse(host.spawnOptions?.env?.[INHERITED_POLICY_ENV] ?? "null"),
+    target,
+  );
+  host.child.exit(0);
+  await running;
+});
+
+test("cancelling a pending launch approval prevents every child spawn", async () => {
+  const host = new FakeHost();
+  const controller = new AbortController();
+  const restricted: EffectivePolicy = {
+    ...effectivePolicy,
+    filesystem: { denyRead: ["/"], allowWrite: ["/project"] },
+  };
+  let answer!: (authorization: {
+    decision: { permission: "directory"; duration: "run" };
+    policy: EffectivePolicy;
+    projectTrusted: false;
+  }) => void;
+  const approval = new Promise<Parameters<typeof answer>[0]>((resolve) => {
+    answer = resolve;
+  });
+  const running = executeSingleAgent({
+    defaultCwd: "/project",
+    dispatchDefaults: {},
+    agents: [agent],
+    agentName: agent.name,
+    task: "outside",
+    cwd: "/other",
+    parentSessionId: "parent",
+    signal: controller.signal,
+    host,
+    effectivePolicy: restricted,
+    authorizeDelegation: async () => approval,
+    validateDelegation: () => true,
+    makeDetails: (results) => ({ mode: "single", projectAgentsDir: null, results }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  answer({
+    decision: { permission: "directory", duration: "run" },
+    policy: effectivePolicy,
+    projectTrusted: false,
+  });
+  const result = await running;
+  assert.equal(result.stopReason, "aborted");
+  assert.equal(host.spawnOptions, undefined);
+});
+
+test("an invalid delegated authorization is refused before spawn", async () => {
+  const host = new FakeHost();
+  let validated: { target: string; access: string } | undefined;
+  const restricted: EffectivePolicy = {
+    ...effectivePolicy,
+    filesystem: { denyRead: ["/"], allowWrite: ["/project"] },
+  };
+  const result = await executeSingleAgent({
+    defaultCwd: "/project",
+    dispatchDefaults: {},
+    agents: [agent],
+    agentName: agent.name,
+    task: "outside",
+    cwd: "/other",
+    parentSessionId: "parent",
+    host,
+    effectivePolicy: restricted,
+    authorizeDelegation: async () => ({
+      decision: { permission: "directory", duration: "run" },
+      policy: effectivePolicy,
+      projectTrusted: false,
+    }),
+    validateDelegation: (target, access) => {
+      validated = { target, access };
+      return false;
+    },
+    makeDetails: (results) => ({ mode: "single", projectAgentsDir: null, results }),
+  });
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(validated, { target: "/other", access: "read-write" });
+  assert.equal(host.spawnOptions, undefined);
 });
 
 test("unknown agents return an equivalent error result without starting a child", async () => {

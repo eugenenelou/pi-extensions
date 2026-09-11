@@ -14,9 +14,6 @@ export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhi
 
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-/** A Claude-style `.mcp.json` `mcpServers` map, already resolved (no `${VAR}`). */
-export type McpServers = Record<string, Record<string, unknown>>;
-
 export const DEFAULT_AGENT_NAME = "default";
 
 export interface AgentConfig {
@@ -25,7 +22,6 @@ export interface AgentConfig {
 	tools?: string[];
 	model?: string;
 	thinking?: ThinkingLevel;
-	mcpServers?: McpServers;
 	systemPrompt: string;
 	source: "builtin" | "user" | "project";
 	filePath: string;
@@ -60,7 +56,6 @@ type AgentFrontmatter = {
 	tools?: unknown;
 	model?: unknown;
 	thinking?: unknown;
-	mcpServers?: unknown;
 };
 
 /**
@@ -87,23 +82,6 @@ function parseThinking(value: unknown): ThinkingLevel | undefined {
 	if (typeof value !== "string") return undefined;
 	const level = value.trim().toLowerCase();
 	return (THINKING_LEVELS as string[]).includes(level) ? (level as ThinkingLevel) : undefined;
-}
-
-/**
- * Accepts both the map form and the list-of-single-key-maps form, because
- * codass emits inline MCP servers as a YAML list.
- */
-function parseMcpServers(value: unknown): McpServers | undefined {
-	const entries: [string, unknown][] = Array.isArray(value)
-		? value.flatMap((item) => (item && typeof item === "object" ? Object.entries(item) : []))
-		: value && typeof value === "object"
-			? Object.entries(value)
-			: [];
-	const servers: McpServers = {};
-	for (const [name, def] of entries) {
-		if (def && typeof def === "object") servers[name] = def as Record<string, unknown>;
-	}
-	return Object.keys(servers).length > 0 ? servers : undefined;
 }
 
 function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
@@ -142,7 +120,6 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			tools: parseToolList(frontmatter.tools),
 			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
 			thinking: parseThinking(frontmatter.thinking),
-			mcpServers: parseMcpServers(frontmatter.mcpServers),
 			systemPrompt: body,
 			source,
 			filePath,

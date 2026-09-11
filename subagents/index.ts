@@ -1,20 +1,19 @@
 /**
  * Subagent tool - delegate tasks to specialized agents.
  *
- * Spawns a separate `pi -p -a` process per invocation, giving each subagent an
- * isolated context window. Modes: single, parallel, chain (`{previous}`).
+ * Spawns a separate RPC-mode Pi process per invocation, giving each subagent
+ * an isolated context window. Modes: single, parallel, chain (`{previous}`).
  *
- * Children are spawned with `-a`, so they trust and load the same project
- * `.pi/settings.json` and therefore this extension: subagents can spawn
- * subagents.
+ * Trusted CLI extensions install the inherited policy before the task starts.
+ * Project resources stay disabled unless target-project permissions were
+ * explicitly approved; the same handoff lets descendants delegate safely.
  *
- * An agent that declares `mcpServers` gets them for that child only: the parent
- * writes the resolved config to a 0600 temp file and passes it as the
- * pi-mcp-adapter's `--mcp-config <path>` flag. Nothing is written to
- * `.mcp.json`, and the parent session never loads those servers.
+ * Repo-controlled agent frontmatter cannot start inline servers or otherwise
+ * expand the effective policy handed down by the parent.
  */
 
 import * as os from "node:os";
+import { fileURLToPath } from "node:url";
 import type {
   AgentToolResult,
   ThinkingLevel,
@@ -25,6 +24,7 @@ import {
   getMarkdownTheme,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import {
   DEFAULT_AGENT_NAME,
@@ -42,7 +42,18 @@ import {
   type SingleResult,
   type SubagentDetails,
 } from "./execution.ts";
-import { LiveChild } from "./live.ts";
+import type { PermissionGlobals } from "../sandbox/authorization.ts";
+import {
+  DelegationApprovalDialog,
+  type DelegationApprovalDecision,
+  type DelegationApprovalRequest,
+} from "./approval-dialog.ts";
+import type { ExtensionUiRequest, ExtensionUiResponse } from "./live.ts";
+
+const TRUSTED_CHILD_EXTENSIONS = [
+  fileURLToPath(import.meta.url),
+  fileURLToPath(new URL("../sandbox/index.ts", import.meta.url)),
+];
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -213,6 +224,16 @@ export async function runSingleAgent(
   signal: AbortSignal | undefined,
   onUpdate: OnUpdateCallback | undefined,
   makeDetails: (results: SingleResult[]) => SubagentDetails,
+  permission?: {
+    effectivePolicy: ReturnType<NonNullable<PermissionGlobals["__codassPermissionBroker"]>["snapshot"]>;
+    authorizeDelegation: NonNullable<PermissionGlobals["__codassPermissionBroker"]>["authorizeDelegation"];
+    validateDelegation: NonNullable<PermissionGlobals["__codassPermissionBroker"]>["validateDelegation"];
+    onUiRequest: (
+      request: ExtensionUiRequest,
+      signal: AbortSignal,
+    ) => Promise<ExtensionUiResponse>;
+  },
+  access: "read" | "read-write" = "read-write",
 ): Promise<SingleResult> {
   return executeSingleAgent({
     defaultCwd,
@@ -221,11 +242,17 @@ export async function runSingleAgent(
     agentName,
     task,
     cwd,
+    access,
     step,
     parentSessionId,
     signal,
     onUpdate,
     makeDetails,
+    effectivePolicy: permission?.effectivePolicy,
+    authorizeDelegation: permission?.authorizeDelegation,
+    validateDelegation: permission?.validateDelegation,
+    onUiRequest: permission?.onUiRequest,
+    inheritedExtensionPaths: TRUSTED_CHILD_EXTENSIONS,
   });
 }
 
@@ -235,6 +262,9 @@ const TaskItem = Type.Object({
   cwd: Type.Optional(
     Type.String({ description: "Working directory for the agent process" }),
   ),
+  access: Type.Optional(StringEnum(["read", "read-write"] as const, {
+    description: "Filesystem access requested at cwd (default: read-write)",
+  })),
 });
 
 const ChainItem = Type.Object({
@@ -245,6 +275,9 @@ const ChainItem = Type.Object({
   cwd: Type.Optional(
     Type.String({ description: "Working directory for the agent process" }),
   ),
+  access: Type.Optional(StringEnum(["read", "read-write"] as const, {
+    description: "Filesystem access requested at cwd (default: read-write)",
+  })),
 });
 
 const SubagentParams = Type.Object({
@@ -271,6 +304,9 @@ const SubagentParams = Type.Object({
       description: "Working directory for the agent process (single mode)",
     }),
   ),
+  access: Type.Optional(StringEnum(["read", "read-write"] as const, {
+    description: "Filesystem access requested at cwd (single mode; default: read-write)",
+  })),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -293,6 +329,112 @@ export default function (pi: ExtensionAPI) {
       };
       const discovery = discoverAgents(ctx.cwd);
       const agents = discovery.agents;
+      const broker = (globalThis as PermissionGlobals).__codassPermissionBroker;
+      const labelFor = (decision: DelegationApprovalDecision) =>
+        decision.permission === "directory"
+          ? decision.duration === "run" ? "Directory access · this run" : "Directory access · remember for session"
+          : decision.duration === "run" ? "Target project permissions · this run" : "Target project permissions · remember for session";
+      const onUiRequest = async (
+        request: ExtensionUiRequest,
+        signal: AbortSignal,
+      ): Promise<ExtensionUiResponse> => {
+        const cancelled = (): ExtensionUiResponse => ({
+          type: "extension_ui_response",
+          id: request.id,
+          cancelled: true,
+        });
+        if (!ctx.hasUI || signal.aborted) return cancelled();
+        if (request.method === "select" && typeof request.title === "string") {
+          const prefix = "CODASS_DELEGATION_REQUEST ";
+          if (request.title.startsWith(prefix) && ctx.mode === "tui") {
+            try {
+              const delegation = JSON.parse(request.title.slice(prefix.length)) as DelegationApprovalRequest;
+              let dismiss: (() => void) | undefined;
+              const decision = await ctx.ui.custom<DelegationApprovalDecision | undefined>((tui, _theme, _keys, done) => {
+                let finished = false;
+                const finish = (value: DelegationApprovalDecision | undefined) => {
+                  if (finished) return;
+                  finished = true;
+                  done(value);
+                };
+                dismiss = () => finish(undefined);
+                signal.addEventListener("abort", dismiss, { once: true });
+                if (signal.aborted) finish(undefined);
+                return new DelegationApprovalDialog(delegation, finish, () => tui.requestRender());
+              });
+              if (dismiss) signal.removeEventListener("abort", dismiss);
+              return decision
+                ? { type: "extension_ui_response", id: request.id, value: labelFor(decision) }
+                : cancelled();
+            } catch {
+              return cancelled();
+            }
+          }
+          const options = Array.isArray(request.options)
+            ? request.options.filter((value): value is string => typeof value === "string")
+            : [];
+          const identity =
+            typeof request.codassRequester === "string"
+              ? `Subagent ${request.codassRequester}${
+                  typeof request.codassTargetCwd === "string"
+                    ? ` in ${request.codassTargetCwd}`
+                    : ""
+                }\n`
+              : "";
+          const value = await ctx.ui.select(
+            request.title.startsWith(prefix)
+              ? request.title
+              : `${identity}${request.title}`,
+            options,
+            { signal },
+          );
+          return value === undefined ? cancelled() : {
+            type: "extension_ui_response",
+            id: request.id,
+            value,
+          };
+        }
+        const identity =
+          typeof request.codassRequester === "string"
+            ? `Subagent ${request.codassRequester}${
+                typeof request.codassTargetCwd === "string"
+                  ? ` in ${request.codassTargetCwd}`
+                  : ""
+              }\n`
+            : "";
+        if (request.method === "confirm") {
+          const confirmed = await ctx.ui.confirm(
+            `${identity}${String(request.title ?? "Permission request")}`,
+            String(request.message ?? ""),
+            { signal },
+          );
+          return signal.aborted ? cancelled() : {
+            type: "extension_ui_response",
+            id: request.id,
+            confirmed,
+          };
+        }
+        if (request.method === "input") {
+          const value = await ctx.ui.input(
+            `${identity}${String(request.title ?? "Permission request")}`,
+            String(request.placeholder ?? ""),
+            { signal },
+          );
+          return value === undefined || signal.aborted
+            ? cancelled()
+            : { type: "extension_ui_response", id: request.id, value };
+        }
+        // Pi's multi-line editor has no AbortSignal API. Do not leave a stale
+        // user-facing dialog open after a descendant disappears.
+        if (request.method === "editor") return cancelled();
+        return cancelled();
+      };
+      const permission = broker ? {
+        effectivePolicy: broker.snapshot(),
+        authorizeDelegation: broker.authorizeDelegation.bind(broker),
+        validateDelegation: broker.validateDelegation.bind(broker),
+        onUiRequest,
+      } : undefined;
 
       const hasChain = (params.chain?.length ?? 0) > 0;
       const hasTasks = (params.tasks?.length ?? 0) > 0;
@@ -357,6 +499,8 @@ export default function (pi: ExtensionAPI) {
             signal,
             chainUpdate,
             makeDetails("chain"),
+            permission,
+            step.access,
           );
           results.push(result);
 
@@ -454,6 +598,8 @@ export default function (pi: ExtensionAPI) {
                 }
               },
               makeDetails("parallel"),
+              permission,
+              t.access,
             );
             allResults[index] = result;
             emitParallelUpdate();
@@ -491,6 +637,8 @@ export default function (pi: ExtensionAPI) {
         signal,
         onUpdate,
         makeDetails("single"),
+        permission,
+        params.access,
       );
       if (isFailedResult(result)) {
         return {

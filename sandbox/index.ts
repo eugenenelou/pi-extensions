@@ -43,24 +43,29 @@
  * the socat-based proxy bridge is never built.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import {
   appendFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   SandboxManager,
   type SandboxRuntimeConfig,
 } from "@anthropic-ai/sandbox-runtime";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -93,8 +98,30 @@ import {
   normalizeFilesystemPattern,
   resolveFilesystemPath,
   type FolderGrant,
+  type ExactFileRead,
   type FilesystemPolicyConfig,
 } from "./filesystem-policy.ts";
+import {
+  INHERITED_POLICY_ENV,
+  MAX_DELEGATION_APPROVALS,
+  SANDBOX_BOOTSTRAP_TIMEOUT_MS,
+  bareEffectivePolicy,
+  delegationMemoryKey,
+  parseEffectivePolicy,
+  policyFingerprint,
+  type DelegationApprovalMemory,
+  type DelegationAuthorization,
+  type EffectivePolicy,
+  type FilesystemApprovalDecision,
+  type FilesystemApprovalRequest,
+  type PermissionBroker,
+  type PermissionGlobals,
+} from "./authorization.ts";
+import {
+  DelegationApprovalDialog,
+  type DelegationApprovalDecision,
+  type DelegationApprovalRequest,
+} from "../subagents/approval-dialog.ts";
 import {
   JUDGE_SYSTEM_PROMPT,
   PermissionMachine,
@@ -119,7 +146,7 @@ import {
   removePendingProposal,
 } from "./permission-rule-file.ts";
 
-type FilesystemConfig = Partial<SandboxRuntimeConfig["filesystem"]> &
+export type FilesystemConfig = Partial<SandboxRuntimeConfig["filesystem"]> &
   FilesystemPolicyConfig & {
     /**
      * Paths kept visible inside a `denyRead` subtree. The runtime has no such
@@ -132,7 +159,7 @@ type FilesystemConfig = Partial<SandboxRuntimeConfig["filesystem"]> &
     grants?: FolderGrant[];
   };
 
-interface SandboxConfig extends Omit<
+export interface SandboxConfig extends Omit<
   SandboxRuntimeConfig,
   "network" | "filesystem"
 > {
@@ -174,6 +201,232 @@ function loadConfig(cwd: string): SandboxConfig {
     console.error(`Warning: Could not parse ${error}`);
   }
   return configValues(layers).reduce<SandboxConfig>(deepMerge, DEFAULT_CONFIG);
+}
+
+/** Bounds keep an unapproved target from turning approval preflight into a disk walk. */
+export const PROJECT_FINGERPRINT_MAX_DEPTH = 24;
+export const PROJECT_FINGERPRINT_MAX_ENTRIES = 20_000;
+export const PROJECT_FINGERPRINT_MAX_FILE_BYTES = 4 * 1024 * 1024;
+export const PROJECT_FINGERPRINT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Fingerprint the repo-controlled resources Pi may load after target-project
+ * approval. Symlinks are hashed as links and their targets are included, but
+ * bounded traversal fails closed before any project code executes.
+ */
+export function projectResourcesFingerprint(cwd: string): string {
+  const hash = createHash("sha256");
+  const seenDirectories = new Set<string>();
+  let entries = 0;
+  let bytes = 0;
+  const visit = (path: string, relative: string, depth: number): void => {
+    entries += 1;
+    if (entries > PROJECT_FINGERPRINT_MAX_ENTRIES)
+      throw new Error("target project has too many trust resources");
+    if (depth > PROJECT_FINGERPRINT_MAX_DEPTH)
+      throw new Error("target project trust resources are nested too deeply");
+    let stat: ReturnType<typeof lstatSync>;
+    try {
+      stat = lstatSync(path);
+    } catch (error) {
+      hash.update(`missing\0${relative}\0${String(error)}\0`);
+      return;
+    }
+    if (stat.isSymbolicLink()) {
+      const link = readlinkSync(path);
+      hash.update(`link\0${relative}\0${link}\0`);
+      try {
+        visit(resolveFilesystemPath(path), `${relative}=>${link}`, depth + 1);
+      } catch (error) {
+        hash.update(`broken\0${relative}\0${String(error)}\0`);
+      }
+      return;
+    }
+    if (stat.isDirectory()) {
+      const canonical = resolveFilesystemPath(path);
+      if (seenDirectories.has(canonical)) {
+        hash.update(`seen-dir\0${relative}\0${canonical}\0`);
+        return;
+      }
+      seenDirectories.add(canonical);
+      hash.update(`dir\0${relative}\0`);
+      for (const name of readdirSync(path).sort()) {
+        visit(join(path, name), join(relative, name), depth + 1);
+      }
+      return;
+    }
+    if (stat.isFile()) {
+      if (stat.size > PROJECT_FINGERPRINT_MAX_FILE_BYTES)
+        throw new Error(`target project trust resource is too large: ${relative}`);
+      bytes += stat.size;
+      if (bytes > PROJECT_FINGERPRINT_MAX_TOTAL_BYTES)
+        throw new Error("target project trust resources are too large");
+      hash.update(`file\0${relative}\0`);
+      hash.update(readFileSync(path));
+      hash.update("\0");
+      return;
+    }
+    hash.update(`other\0${relative}\0${stat.mode}\0${stat.size}\0`);
+  };
+  for (const name of [CONFIG_DIR_NAME, ".agents"]) {
+    visit(join(cwd, name), name, 0);
+  }
+
+  // Project settings may load mutable local packages or individual resources
+  // from outside .pi. Hash those targets too; otherwise changing an external
+  // extension could silently reuse a remembered target-project approval.
+  const settingsPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
+  let settings: Record<string, unknown> | undefined;
+  try {
+    settings = JSON.parse(readFileSync(settingsPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+  } catch {
+    // The raw settings file is already in the hash. Invalid settings load no
+    // referenced resources, matching Pi's fail-closed settings behavior.
+  }
+  if (settings) {
+    const sources: string[] = [];
+    for (const key of ["extensions", "skills", "prompts", "themes"] as const) {
+      const values = settings[key];
+      if (Array.isArray(values)) {
+        sources.push(...values.filter((value): value is string => typeof value === "string"));
+      }
+    }
+    if (Array.isArray(settings.packages)) {
+      for (const entry of settings.packages) {
+        if (typeof entry === "string") sources.push(entry);
+        else if (entry && typeof entry === "object") {
+          const source = (entry as { source?: unknown }).source;
+          if (typeof source === "string") sources.push(source);
+        }
+      }
+    }
+    const remote = /^(?:npm:|git:|github:|https?:|ssh:)/;
+    for (const [index, configured] of sources.entries()) {
+      const source = configured.startsWith("!") ? configured.slice(1) : configured;
+      if (!source || remote.test(source)) continue;
+      let path: string;
+      try {
+        path = source.startsWith("file://")
+          ? fileURLToPath(source)
+          : expandFilesystemPath(source, dirname(settingsPath));
+      } catch (error) {
+        hash.update(`invalid-resource\0${index}\0${source}\0${String(error)}\0`);
+        continue;
+      }
+      if (hasFilesystemGlob(path)) {
+        const globAt = path.search(/[*?[\]]/);
+        const prefix = path.slice(0, globAt);
+        path = prefix.endsWith("/") ? prefix.slice(0, -1) : dirname(prefix);
+      }
+      visit(
+        isAbsolute(path) ? path : resolve(dirname(settingsPath), path),
+        `settings-resource-${index}`,
+        0,
+      );
+    }
+  }
+
+  // Pi discovers project .agents/skills while walking ancestors. Include the
+  // same roots, excluding the user's global ~/.agents/skills directory.
+  const userSkills = resolveFilesystemPath(join(homedir(), ".agents", "skills"));
+  let ancestor = resolveFilesystemPath(cwd);
+  let ancestorIndex = 0;
+  for (;;) {
+    const skills = join(ancestor, ".agents", "skills");
+    let canonicalSkills = skills;
+    try {
+      canonicalSkills = resolveFilesystemPath(skills);
+    } catch {
+      // Missing roots are still hashed by visit below.
+    }
+    if (canonicalSkills !== userSkills) {
+      visit(skills, `ancestor-skills-${ancestorIndex}`, 0);
+    }
+    const parent = dirname(ancestor);
+    if (parent === ancestor) break;
+    ancestor = parent;
+    ancestorIndex += 1;
+  }
+  return hash.digest("hex");
+}
+
+const FILESYSTEM_PATH_KEYS = [
+  "allowRead",
+  "allowWrite",
+  "denyRead",
+  "denyWrite",
+  "protectedRead",
+  "protectedWrite",
+] as const;
+
+/** Freeze relative policy entries at the project where they were authored. */
+export function materializeFilesystem(
+  filesystem: FilesystemConfig,
+  cwd: string,
+): FilesystemConfig {
+  const result: FilesystemConfig = { ...filesystem };
+  for (const key of FILESYSTEM_PATH_KEYS) {
+    const entries = filesystem[key];
+    if (entries)
+      result[key] = entries.map((entry) =>
+        normalizeFilesystemPattern(entry, cwd),
+      );
+  }
+  if (filesystem.grants) {
+    result.grants = new FilesystemPolicy({}, cwd, filesystem.grants).grants();
+  }
+  return result;
+}
+
+/** Validate a broker result against the authority active at launch time. */
+export function delegatedAuthorizationMatches(
+  inherited: EffectivePolicy,
+  targetPolicy: EffectivePolicy | undefined,
+  target: string,
+  access: "read" | "read-write",
+  authorization: DelegationAuthorization,
+  cwd: string,
+): boolean {
+  if (authorization.decision.permission === "target-project") {
+    return (
+      authorization.projectTrusted === true &&
+      authorization.policy.toolMode === "target-project" &&
+      targetPolicy !== undefined &&
+      policyFingerprint(targetPolicy) === policyFingerprint(authorization.policy)
+    );
+  }
+  if (
+    authorization.projectTrusted ||
+    authorization.policy.toolMode !== "inherited"
+  ) return false;
+
+  const activePolicy = new FilesystemPolicy(
+    inherited.filesystem,
+    cwd,
+    inherited.grants,
+    process.platform,
+    inherited.exactReads,
+  );
+  const alreadyAuthorized =
+    activePolicy.evaluate("read", target).state === "allowed" &&
+    (access === "read" ||
+      activePolicy.evaluate("write", target).state === "allowed");
+  if (
+    alreadyAuthorized &&
+    policyFingerprint(inherited) === policyFingerprint(authorization.policy)
+  ) return true;
+
+  const expected: EffectivePolicy = {
+    ...inherited,
+    grants: new FilesystemPolicy({}, cwd, [
+      ...inherited.grants,
+      { root: target, mode: access },
+    ]).grants(),
+  };
+  return policyFingerprint(expected) === policyFingerprint(authorization.policy);
 }
 
 /**
@@ -560,6 +813,7 @@ export function applyMacReadGrants(
   platform: NodeJS.Platform = process.platform,
   visibleRoots: string[] = [],
   allowGitConfig = false,
+  exactReads: ExactFileRead[] = [],
 ): string {
   if (platform !== "darwin") return command;
   const readable = new FilesystemPolicy({}, cwd, grants).grants();
@@ -568,7 +822,8 @@ export function applyMacReadGrants(
     cwd,
     visibleRoots.map((root) => ({ root, mode: "read" as const })),
   ).grants();
-  if (readable.length === 0 && visible.length === 0) return command;
+  if (readable.length === 0 && visible.length === 0 && exactReads.length === 0)
+    return command;
   const profileMatch = /sandbox-exec -p ('(?:[^']|'\\''?)*') /.exec(command);
   if (!profileMatch) return command;
   const quoted = profileMatch[1];
@@ -588,14 +843,52 @@ export function applyMacReadGrants(
       (path) => `(deny file-write* (subpath ${JSON.stringify(path)}))`,
     ),
   );
+  const exactRules = exactReads.flatMap((entry) => {
+    try {
+      const path = resolveFilesystemPath(expandFilesystemPath(entry.path, cwd));
+      return statSync(path).isFile()
+        ? [`(allow file-read* (literal ${JSON.stringify(path)}))`]
+        : [];
+    } catch {
+      return [];
+    }
+  });
   const exceptions = [
     ...[...readable, ...visible].map(
       (grant) => `(allow file-read* (subpath ${JSON.stringify(grant.root)}))`,
     ),
     ...protectedRules,
     ...mandatoryWriteRules,
+    ...exactRules,
   ].join("\n");
   return command.replace(quoted, shellQuote(`${profile}\n${exceptions}`));
+}
+
+/** Re-expose user-attached files after every broader Linux deny mount. */
+export function applyExactFileReads(
+  command: string,
+  exactReads: ExactFileRead[],
+  cwd: string,
+): string {
+  if (!command.startsWith("bwrap ") || exactReads.length === 0) return command;
+  const sep = shellArgumentSeparator(command);
+  if (sep === -1) return command;
+  const files = [
+    ...new Set(
+      exactReads.flatMap((entry) => {
+        try {
+          const path = resolveFilesystemPath(
+            expandFilesystemPath(entry.path, cwd),
+          );
+          return statSync(path).isFile() ? [path] : [];
+        } catch {
+          return [];
+        }
+      }),
+    ),
+  ];
+  if (files.length === 0) return command;
+  return `${command.slice(0, sep)} ${files.map((path) => `--ro-bind ${shellQuote(path)} ${shellQuote(path)}`).join(" ")}${command.slice(sep)}`;
 }
 
 export function applyExecutionGrants(
@@ -875,6 +1168,7 @@ export async function wrapForSandbox(
   filesystem: FilesystemConfig,
   cwd: string = process.cwd(),
   executionGrants: FolderGrant[] = [],
+  exactReads: ExactFileRead[] = [],
 ): Promise<string> {
   const effective = effectiveFilesystem(filesystem, cwd, executionGrants);
   const {
@@ -894,23 +1188,28 @@ export async function wrapForSandbox(
   );
   const grants = [...(filesystem.grants ?? []), ...executionGrants];
   return withJailLock(
-    applyMacReadGrants(
-      applyExecutionGrants(
-        applyAllowRead(wrapped, effective),
+    applyExactFileReads(
+      applyMacReadGrants(
+        applyExecutionGrants(
+          applyAllowRead(wrapped, effective),
+          grants,
+          cwd,
+          effective.protectedRead ?? [],
+          [...(effective.denyWrite ?? []), ...(effective.protectedWrite ?? [])],
+          effective.allowRead ?? [],
+          filesystem.allowGitConfig === true,
+          effective.allowWrite ?? [],
+        ),
         grants,
         cwd,
         effective.protectedRead ?? [],
-        [...(effective.denyWrite ?? []), ...(effective.protectedWrite ?? [])],
-        effective.allowRead ?? [],
+        process.platform,
+        [...(effective.allowRead ?? []), ...(effective.allowWrite ?? [])],
         filesystem.allowGitConfig === true,
-        effective.allowWrite ?? [],
+        exactReads,
       ),
-      grants,
+      exactReads,
       cwd,
-      effective.protectedRead ?? [],
-      process.platform,
-      [...(effective.allowRead ?? []), ...(effective.allowWrite ?? [])],
-      filesystem.allowGitConfig === true,
     ),
   );
 }
@@ -937,7 +1236,10 @@ export async function verifySandboxBootstrap(
       });
       let stderr = "";
       child.stderr?.on("data", (chunk) => (stderr += chunk));
-      const timer = setTimeout(() => child.kill("SIGKILL"), 15_000);
+      const timer = setTimeout(
+        () => child.kill("SIGKILL"),
+        SANDBOX_BOOTSTRAP_TIMEOUT_MS,
+      );
       child.on("error", (error) => {
         clearTimeout(timer);
         resolve({ status: null, stderr: String(error) });
@@ -976,6 +1278,7 @@ function createSandboxedBashOps(
   trace: boolean,
   filesystem: FilesystemConfig,
   executionGrants: FolderGrant[] = [],
+  exactReads: ExactFileRead[] = [],
 ): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout }) {
@@ -1001,6 +1304,7 @@ function createSandboxedBashOps(
         filesystem,
         cwd,
         executionGrants,
+        exactReads,
       );
 
       const placeholders = placeholderBinds(wrappedCommand);
@@ -1142,12 +1446,16 @@ export function sandboxPathReason(
   cwd: string,
   filesystem: FilesystemConfig,
   executionGrants: FolderGrant[] = [],
+  exactReads: ExactFileRead[] = [],
 ): string | undefined {
   if (typeof rawPath !== "string" || !rawPath) return undefined;
-  const policy = new FilesystemPolicy(filesystem, cwd, [
-    ...(filesystem.grants ?? []),
-    ...executionGrants,
-  ]);
+  const policy = new FilesystemPolicy(
+    filesystem,
+    cwd,
+    [...(filesystem.grants ?? []), ...executionGrants],
+    process.platform,
+    exactReads,
+  );
   const mode = tool === "write" || tool === "edit" ? "write" : "read";
   const decision =
     mode === "read" && ["grep", "find", "ls"].includes(tool)
@@ -1393,6 +1701,25 @@ function publishMarker(
 }
 
 export default function (pi: ExtensionAPI) {
+  // Target-project children deliberately do not use --approve: that CLI
+  // override bypasses project_trust handlers. This global handler verifies the
+  // exact approved resource snapshot before Pi executes any project extension.
+  pi.on("project_trust", (event) => {
+    const inherited = parseEffectivePolicy(process.env[INHERITED_POLICY_ENV]);
+    if (inherited?.toolMode !== "target-project")
+      return { trusted: "undecided" };
+    try {
+      const target = resolveFilesystemPath(event.cwd);
+      const valid =
+        target === inherited.targetProjectRoot &&
+        projectResourcesFingerprint(target) ===
+          inherited.projectResourcesFingerprint;
+      return { trusted: valid ? "yes" : "no" };
+    } catch {
+      return { trusted: "no" };
+    }
+  });
+
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
     type: "boolean",
@@ -1413,6 +1740,7 @@ export default function (pi: ExtensionAPI) {
    * instead of capturing it.
    */
   let deciding: ExtensionContext | undefined;
+  const session = (): ExtensionContext | undefined => deciding;
   const unattended = noHumanPresent(process.env, process.argv);
   /** Every dialog of this extension: nobody to ask, or nobody answering, refuses. */
   const askHuman = async (
@@ -1426,46 +1754,108 @@ export default function (pi: ExtensionAPI) {
           .value;
   const permissionHost: PermissionHost = {
     canAsk: () => !unattended && (deciding?.hasUI ?? false),
-    cwd: () => deciding?.cwd ?? localCwd,
+    cwd: () => session()?.cwd ?? localCwd,
     readRules: (scope) => {
-      const cwd = deciding?.cwd ?? localCwd;
+      if (inheritedPolicy) return [];
+      const cwd = session()?.cwd ?? localCwd;
       return ruleFileConfig(localRulesPath(scope, cwd)).allow ?? [];
     },
     addRule: (scope, rule, targetCwd) =>
       addAllowRule(
-        localRulesPath(scope, targetCwd ?? deciding?.cwd ?? localCwd),
+        localRulesPath(scope, targetCwd ?? session()?.cwd ?? localCwd),
         rule,
       ),
     // The machine-wide file, whichever worktree proposed the rule: the layer is
     // chosen at acceptance, from the working directory recorded in the entry.
     readPending: () =>
-      ruleFileConfig(localRulesPath("global", deciding?.cwd ?? localCwd))
+      ruleFileConfig(localRulesPath("global", session()?.cwd ?? localCwd))
         .pending ?? [],
     addPending: (proposal) =>
       addPendingProposal(
-        localRulesPath("global", deciding?.cwd ?? localCwd),
+        localRulesPath("global", session()?.cwd ?? localCwd),
         proposal,
       ),
     removePending: (proposal) =>
       removePendingProposal(
-        localRulesPath("global", deciding?.cwd ?? localCwd),
+        localRulesPath("global", session()?.cwd ?? localCwd),
         proposal,
       ),
     judge: (call, signal) =>
       deciding
         ? askJudge(deciding, call, signal)
         : Promise.resolve({ verdict: "ask", reason: "no session context" }),
-    select: async (message, choices) =>
-      deciding?.hasUI ? deciding.ui.select(message, choices) : undefined,
-    editRule: async (message, prefill) =>
-      deciding?.hasUI ? deciding.ui.editor(message, prefill) : undefined,
+    select: async (message, choices) => {
+      const ctx = session();
+      return ctx?.hasUI ? ctx.ui.select(message, choices) : undefined;
+    },
+    editRule: async (message, prefill) => {
+      const ctx = session();
+      return ctx?.hasUI ? ctx.ui.editor(message, prefill) : undefined;
+    },
   };
   const permissions = new PermissionMachine({}, permissionHost);
+  let currentPermissionConfig: PermissionConfig = {};
+  let activeSandboxConfig: SandboxConfig = {};
+  let inheritedPolicy: EffectivePolicy | undefined;
+  let inheritedHandoff = false;
+  let policyReadyEmitted = false;
   let filesystem: FilesystemConfig = {};
   let traceEnabled = false;
+  let sessionContext: ExtensionContext | undefined;
+  const conversationGrants: FolderGrant[] = [];
+  const exactReads: ExactFileRead[] = [];
+  const rememberedDelegations = new Map<string, {
+    target: string;
+    access: "read" | "read-write";
+    authorization: DelegationAuthorization;
+  }>();
+  const delegationApprovalMemory = (): DelegationApprovalMemory[] =>
+    [...rememberedDelegations.values()].map(({ target, access, authorization }) => ({
+      target,
+      access,
+      permission: authorization.decision.permission,
+      policy: bareEffectivePolicy(authorization.policy),
+    }));
+  const policyWithDelegationMemory = (policy: EffectivePolicy): EffectivePolicy => {
+    const approvals = delegationApprovalMemory();
+    return {
+      ...bareEffectivePolicy(policy),
+      ...(approvals.length > 0 ? { delegationApprovals: approvals } : {}),
+    };
+  };
+  const rememberDelegation = (
+    target: string,
+    access: "read" | "read-write",
+    authorization: DelegationAuthorization,
+  ): void => {
+    const decision = { ...authorization.decision, duration: "session" as const };
+    const bareAuthorization: DelegationAuthorization = {
+      decision,
+      projectTrusted: authorization.projectTrusted,
+      policy: bareEffectivePolicy(authorization.policy),
+    };
+    const key = delegationMemoryKey(
+      target,
+      access,
+      decision,
+      bareAuthorization.policy,
+    );
+    rememberedDelegations.delete(key);
+    rememberedDelegations.set(key, {
+      target,
+      access,
+      authorization: bareAuthorization,
+    });
+    while (rememberedDelegations.size > MAX_DELEGATION_APPROVALS) {
+      const oldest = rememberedDelegations.keys().next().value;
+      if (oldest === undefined) break;
+      rememberedDelegations.delete(oldest);
+    }
+  };
   // A grant is consumed by the execution id it was issued for. Keeping this
   // map outside the base policy prevents sibling calls from inheriting it.
   const executionGrants = new Map<string, FolderGrant[]>();
+  const executionExactReads = new Map<string, ExactFileRead[]>();
   const grantForExecution: CodassSandboxGrantForExecution = (id, grants) => {
     executionGrants.set(
       id,
@@ -1479,6 +1869,296 @@ export default function (pi: ExtensionAPI) {
     executionGrants.delete(id);
     return grants;
   };
+  const exactReadsForExecution = (id: string): ExactFileRead[] =>
+    executionExactReads.get(id) ?? [];
+  const takeExactReadsForExecution = (id: string): ExactFileRead[] => {
+    const reads = exactReadsForExecution(id);
+    executionExactReads.delete(id);
+    return reads;
+  };
+
+  const snapshot = (): EffectivePolicy => ({
+    version: 1,
+    sandbox: {
+      ...activeSandboxConfig,
+      filesystem: materializeFilesystem(
+        filesystem,
+        sessionContext?.cwd ?? localCwd,
+      ),
+    },
+    filesystem: materializeFilesystem(
+      filesystem,
+      sessionContext?.cwd ?? localCwd,
+    ) as Record<string, unknown>,
+    permissions: {
+      ...currentPermissionConfig,
+      allow: permissions.effectiveAllowRules(),
+    },
+    tools: pi.getActiveTools(),
+    toolMode: "inherited",
+    grants: new FilesystemPolicy({}, sessionContext?.cwd ?? localCwd, [
+      ...(filesystem.grants ?? []),
+      ...conversationGrants,
+    ]).grants(),
+    exactReads: exactReads.map((entry) => ({ ...entry })),
+    ...(rememberedDelegations.size > 0
+      ? { delegationApprovals: delegationApprovalMemory() }
+      : {}),
+  });
+
+  const delegationChoices = new Map<string, DelegationApprovalDecision>([
+    [
+      "Directory access · this run",
+      { permission: "directory", duration: "run" },
+    ],
+    [
+      "Directory access · remember for session",
+      { permission: "directory", duration: "session" },
+    ],
+    [
+      "Target project permissions · this run",
+      { permission: "target-project", duration: "run" },
+    ],
+    [
+      "Target project permissions · remember for session",
+      { permission: "target-project", duration: "session" },
+    ],
+  ]);
+
+  const askDelegation = async (
+    ctx: ExtensionContext,
+    request: DelegationApprovalRequest,
+    signal?: AbortSignal,
+  ): Promise<DelegationApprovalDecision | undefined> => {
+    if (!ctx.hasUI || signal?.aborted) return undefined;
+    if (ctx.mode === "tui") {
+      let dismiss: (() => void) | undefined;
+      const result = await ctx.ui.custom<DelegationApprovalDecision | undefined>(
+        (tui, _theme, _keys, done) => {
+          let finished = false;
+          const finish = (value: DelegationApprovalDecision | undefined) => {
+            if (finished) return;
+            finished = true;
+            done(value);
+          };
+          dismiss = () => finish(undefined);
+          signal?.addEventListener("abort", dismiss, { once: true });
+          if (signal?.aborted) finish(undefined);
+          return new DelegationApprovalDialog(request, finish, () =>
+            tui.requestRender(),
+          );
+        },
+      );
+      if (dismiss) signal?.removeEventListener("abort", dismiss);
+      return signal?.aborted ? undefined : result;
+    }
+    const selected = await ctx.ui.select(
+      `CODASS_DELEGATION_REQUEST ${JSON.stringify(request)}`,
+      [...delegationChoices.keys(), "Cancel"],
+      { signal },
+    );
+    return signal?.aborted ? undefined : delegationChoices.get(selected ?? "");
+  };
+
+  const resolveTargetPolicy = (target: string): EffectivePolicy => {
+    const sandbox = loadConfig(target);
+    const fs = materializeFilesystem(sandbox.filesystem ?? {}, target);
+    const permission = loadPermissionConfig(target);
+    const allow = [
+      ...(permission.allow ?? []),
+      ...(ruleFileConfig(localRulesPath("worktree", target)).allow ?? []),
+      ...(ruleFileConfig(localRulesPath("global", target)).allow ?? []),
+    ];
+    return {
+      version: 1,
+      sandbox: { ...sandbox, filesystem: fs },
+      filesystem: fs as Record<string, unknown>,
+      permissions: { ...permission, allow: [...new Set(allow)] },
+      // Resolving target resources reads but never executes them. Pi loads the
+      // normal target tool set only after explicit target-project approval.
+      tools: pi.getActiveTools(),
+      toolMode: "target-project",
+      targetProjectRoot: target,
+      projectResourcesFingerprint: projectResourcesFingerprint(target),
+      grants: new FilesystemPolicy({}, target, fs.grants ?? []).grants(),
+      exactReads: [],
+    };
+  };
+
+  const broker: PermissionBroker = {
+    snapshot,
+    resolveTargetPolicy,
+    validateDelegation(target, access, authorization) {
+      try {
+        if (resolveFilesystemPath(target) !== target) return false;
+        return delegatedAuthorizationMatches(
+          snapshot(),
+          authorization.decision.permission === "target-project"
+            ? resolveTargetPolicy(target)
+            : undefined,
+          target,
+          access,
+          authorization,
+          sessionContext?.cwd ?? localCwd,
+        );
+      } catch {
+        return false;
+      }
+    },
+    async authorizeDelegation(request, signal) {
+      const ctx = sessionContext;
+      if (!ctx || signal?.aborted) return undefined;
+      const inherited = snapshot();
+      const directoryPolicy: EffectivePolicy = {
+        ...inherited,
+        grants: new FilesystemPolicy({}, ctx.cwd, [
+          ...inherited.grants,
+          { root: request.target, mode: request.access },
+        ]).grants(),
+      };
+      let targetPolicy: EffectivePolicy;
+      try {
+        targetPolicy = resolveTargetPolicy(request.target);
+      } catch {
+        return undefined;
+      }
+      for (const [decision, policy] of [
+        [
+          { permission: "directory", duration: "session" } as const,
+          directoryPolicy,
+        ],
+        [
+          { permission: "target-project", duration: "session" } as const,
+          targetPolicy,
+        ],
+      ] as const) {
+        const remembered = rememberedDelegations.get(
+          delegationMemoryKey(request.target, request.access, decision, policy),
+        );
+        if (remembered) {
+          const authorization = structuredClone(remembered.authorization);
+          return {
+            ...authorization,
+            policy: policyWithDelegationMemory(authorization.policy),
+          };
+        }
+      }
+      const decision = await askDelegation(ctx, request, signal);
+      if (!decision || signal?.aborted) return undefined;
+      const policy =
+        decision.permission === "directory" ? directoryPolicy : targetPolicy;
+      const authorization: DelegationAuthorization = {
+        decision,
+        policy: bareEffectivePolicy(policy),
+        projectTrusted: decision.permission === "target-project",
+      };
+      if (decision.duration === "session") {
+        rememberDelegation(request.target, request.access, authorization);
+      }
+      return {
+        ...authorization,
+        policy: policyWithDelegationMemory(authorization.policy),
+      };
+    },
+    async requestFilesystem(request, signal) {
+      const ctx = sessionContext;
+      if (!ctx?.hasUI || signal?.aborted) return undefined;
+      const choices = request.requestId.startsWith("access-tool-")
+        ? ["Allow for this conversation", "Cancel"]
+        : ["Allow for this operation", "Allow for this conversation", "Cancel"];
+      const choice = await ctx.ui.select(
+        `${request.requester} requests ${request.access} access to ${request.path}\n${request.reason}`,
+        choices,
+        { signal },
+      );
+      if (
+        signal?.aborted ||
+        choice !== "Allow for this operation" &&
+        choice !== "Allow for this conversation"
+      ) {
+        return undefined;
+      }
+      let kind: "directory" | "exact-file" = "directory";
+      if (request.access === "read") {
+        try {
+          if (statSync(request.path).isFile()) kind = "exact-file";
+        } catch {
+          // A missing target can only receive the normal directory capability.
+        }
+      }
+      return {
+        duration:
+          choice === "Allow for this operation" ? "operation" : "conversation",
+        kind,
+      };
+    },
+    applyFilesystemDecision(request, decision, executionId) {
+      if (!decision) return;
+      if (decision.kind === "exact-file") {
+        const read = { path: request.path };
+        if (decision.duration === "conversation") exactReads.push(read);
+        else if (executionId) executionExactReads.set(executionId, [read]);
+        return;
+      }
+      const grant: FolderGrant = { root: request.path, mode: request.access };
+      if (decision.duration === "conversation") conversationGrants.push(grant);
+      else if (executionId) grantForExecution(executionId, [grant]);
+    },
+  };
+  (globalThis as PermissionGlobals).__codassPermissionBroker = broker;
+
+  pi.registerTool({
+    name: "request_filesystem_access",
+    label: "request filesystem access",
+    description:
+      "Ask the user for narrowly scoped read-only or read-and-write filesystem access. This grants no command permission.",
+    parameters: Type.Object({
+      path: Type.String({
+        description: "Exact file or directory requiring access",
+      }),
+      access: StringEnum(["read", "read-write"] as const),
+      reason: Type.String({ description: "Why this operation needs access" }),
+    }),
+    async execute(id, params, signal, _update, ctx) {
+      let path: string;
+      try {
+        path = resolveFilesystemPath(
+          expandFilesystemPath(params.path, ctx.cwd),
+        );
+      } catch {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Invalid filesystem path; no access granted.",
+            },
+          ],
+          details: {},
+        };
+      }
+      const request: FilesystemApprovalRequest = {
+        requestId: `access-tool-${id}`,
+        requester: `session ${ctx.sessionManager.getSessionId()}`,
+        path,
+        access: params.access,
+        reason: params.reason,
+      };
+      const decision = await broker.requestFilesystem(request, signal);
+      if (!signal?.aborted)
+        broker.applyFilesystemDecision(request, decision);
+      return {
+        content: [
+          {
+            type: "text",
+            text: decision
+              ? `${params.access} access approved for ${path} for this conversation.`
+              : `Filesystem access refused for ${path}.`,
+          },
+        ],
+        details: { path, access: params.access, approved: Boolean(decision) },
+      };
+    },
+  });
 
   pi.registerTool({
     ...localBash,
@@ -1492,8 +2172,12 @@ export default function (pi: ExtensionAPI) {
       const sandboxedBash = createBashTool(localCwd, {
         operations: createSandboxedBashOps(
           traceEnabled,
-          filesystem,
+          {
+            ...filesystem,
+            grants: [...(filesystem.grants ?? []), ...conversationGrants],
+          },
           grantsForExecution(id),
+          [...exactReads, ...exactReadsForExecution(id)],
         ),
       });
       return sandboxedBash.execute(id, params, signal, onUpdate);
@@ -1504,7 +2188,15 @@ export default function (pi: ExtensionAPI) {
     await bootstrapPending;
     if (!sandboxEnabled || !sandboxInitialized) return;
     return {
-      operations: createSandboxedBashOps(traceEnabled, filesystem),
+      operations: createSandboxedBashOps(
+        traceEnabled,
+        {
+          ...filesystem,
+          grants: [...(filesystem.grants ?? []), ...conversationGrants],
+        },
+        [],
+        exactReads,
+      ),
     };
   });
 
@@ -1532,7 +2224,9 @@ export default function (pi: ExtensionAPI) {
     input: { command?: string; path?: unknown },
     ctx: ExtensionContext,
   ) => {
-    const config = loadPermissionConfig(ctx.cwd);
+    const config = inheritedPolicy
+      ? currentPermissionConfig
+      : loadPermissionConfig(ctx.cwd);
     if (!config.unreadable && !config.deny?.length && !config.allow?.length) {
       return undefined;
     }
@@ -1593,14 +2287,67 @@ export default function (pi: ExtensionAPI) {
           event.toolName,
           path,
           ctx.cwd,
-          filesystem,
+          {
+            ...filesystem,
+            grants: [...(filesystem.grants ?? []), ...conversationGrants],
+          },
           grantsForExecution(event.toolCallId),
+          [...exactReads, ...exactReadsForExecution(event.toolCallId)],
         );
+        const canRequestSpecificRead =
+          event.toolName === "read" &&
+          (() => {
+            try {
+              return statSync(
+                resolveFilesystemPath(
+                  expandFilesystemPath(path as string, ctx.cwd),
+                ),
+              ).isFile();
+            } catch {
+              return false;
+            }
+          })();
+        if (
+          pathReason &&
+          (!pathReason.includes("protected") || canRequestSpecificRead)
+        ) {
+          const request: FilesystemApprovalRequest = {
+            requestId: event.toolCallId,
+            requester: `session ${ctx.sessionManager.getSessionId()}`,
+            path: resolveFilesystemPath(
+              expandFilesystemPath(path as string, ctx.cwd),
+            ),
+            access:
+              event.toolName === "write" || event.toolName === "edit"
+                ? "read-write"
+                : "read",
+            reason: `${event.toolName} needs this filesystem access`,
+          };
+          const decision = await broker.requestFilesystem(request, ctx.signal);
+          if (!ctx.signal?.aborted)
+            broker.applyFilesystemDecision(request, decision, event.toolCallId);
+          if (decision && !ctx.signal?.aborted) {
+            pathReason = sandboxPathReason(
+              event.toolName,
+              path,
+              ctx.cwd,
+              {
+                ...filesystem,
+                grants: [...(filesystem.grants ?? []), ...conversationGrants],
+              },
+              grantsForExecution(event.toolCallId),
+              [...exactReads, ...exactReadsForExecution(event.toolCallId)],
+            );
+          }
+        }
         reason = pathReason;
       }
     }
 
-    if (!reason) return decide(event.toolName, input, ctx);
+    if (!reason) {
+      if (event.toolName === "request_filesystem_access") return undefined;
+      return decide(event.toolName, input, ctx);
+    }
     const message = `sandbox guard: ${reason}`;
     // A command approval must not turn into a filesystem capability. A later
     // folder-access flow supplies an execution-bound policy grant instead.
@@ -1621,6 +2368,29 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_execution_end", (event) => {
     executionGrants.delete(event.toolCallId);
+    executionExactReads.delete(event.toolCallId);
+  });
+
+  // Interactive @path tokens are the only textual attachment provenance Pi's
+  // extension API exposes. RPC/subagent text and quoted <file> markup are inert.
+  pi.on("input", (event, ctx) => {
+    if (event.source !== "interactive") return { action: "continue" };
+    for (const match of event.text.matchAll(/(?:^|\s)@([^\s"'<>]+)/g)) {
+      try {
+        const path = resolveFilesystemPath(
+          expandFilesystemPath(match[1], ctx.cwd),
+        );
+        if (
+          statSync(path).isFile() &&
+          !exactReads.some((entry) => entry.path === path)
+        ) {
+          exactReads.push({ path });
+        }
+      } catch {
+        // A reference that does not resolve to an existing file grants nothing.
+      }
+    }
+    return { action: "continue" };
   });
 
   pi.on("tool_result", (event) => {
@@ -1650,28 +2420,89 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    const emitPolicyReady = (ready: boolean, reason?: string) => {
+      if (!inheritedHandoff || policyReadyEmitted || ctx.mode !== "rpc") return;
+      policyReadyEmitted = true;
+      process.stderr.write(
+        `${JSON.stringify({ type: "codass_policy_ready", ready, ...(reason ? { reason } : {}) })}\n`,
+      );
+    };
     permissions.reset();
     executionGrants.clear();
+    executionExactReads.clear();
+    conversationGrants.length = 0;
+    exactReads.length = 0;
+    rememberedDelegations.clear();
+    sessionContext = ctx;
     filesystem = {};
+    activeSandboxConfig = {};
+    currentPermissionConfig = {};
+    inheritedPolicy = undefined;
+    inheritedHandoff = false;
+    policyReadyEmitted = false;
     traceEnabled = false;
     sandboxEnabled = false;
     sandboxInitialized = false;
     bootstrapPending = undefined;
+    const inheritedText = process.env[INHERITED_POLICY_ENV];
+    inheritedHandoff = inheritedText !== undefined;
+    delete process.env[INHERITED_POLICY_ENV];
+    inheritedPolicy = parseEffectivePolicy(inheritedText);
+    if (inheritedText && !inheritedPolicy) {
+      publishMarker({
+        active: false,
+        reason: "invalid inherited permission policy",
+      });
+      ctx.ui.notify(
+        "Sandbox refused: invalid inherited permission policy",
+        "error",
+      );
+      emitPolicyReady(false, "invalid inherited permission policy");
+      return;
+    }
     const noSandbox = pi.getFlag("no-sandbox") as boolean;
 
     if (noSandbox) {
       sandboxEnabled = false;
       publishMarker({ active: false, reason: "--no-sandbox" });
       ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
+      emitPolicyReady(
+        false,
+        "--no-sandbox cannot enforce inherited permissions",
+      );
       return;
     }
 
-    const config = loadConfig(ctx.cwd);
+    const config = inheritedPolicy
+      ? (inheritedPolicy.sandbox as SandboxConfig)
+      : loadConfig(ctx.cwd);
+    activeSandboxConfig = config;
+    currentPermissionConfig =
+      inheritedPolicy?.permissions ?? loadPermissionConfig(ctx.cwd);
+    permissions.setConfig(currentPermissionConfig);
+    if (inheritedPolicy) {
+      filesystem = inheritedPolicy.filesystem as FilesystemConfig;
+      filesystem.grants = [...(inheritedPolicy.grants ?? [])];
+      exactReads.push(
+        ...inheritedPolicy.exactReads.map((entry) => ({ ...entry })),
+      );
+      for (const approval of inheritedPolicy.delegationApprovals ?? []) {
+        rememberDelegation(approval.target, approval.access, {
+          decision: {
+            permission: approval.permission,
+            duration: "session",
+          },
+          policy: approval.policy,
+          projectTrusted: approval.permission === "target-project",
+        });
+      }
+    }
 
     if (!config.enabled) {
       sandboxEnabled = false;
       publishMarker({ active: false, reason: "disabled in sandbox.json" });
       ctx.ui.notify("Sandbox disabled via config", "info");
+      emitPolicyReady(true);
       return;
     }
 
@@ -1683,12 +2514,13 @@ export default function (pi: ExtensionAPI) {
         reason: `unsupported platform ${platform}`,
       });
       ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
+      emitPolicyReady(false, `sandbox not supported on ${platform}`);
       return;
     }
 
     const networkRestricted = config.network?.allowedDomains !== undefined;
 
-    filesystem = config.filesystem ?? {};
+    filesystem = inheritedPolicy ? filesystem : (config.filesystem ?? {});
     traceEnabled =
       config.trace === true || process.env.PI_SANDBOX_TRACE === "1";
     if (traceEnabled && !hasStrace()) {
@@ -1711,6 +2543,7 @@ export default function (pi: ExtensionAPI) {
       sandboxEnabled = false;
       publishMarker({ active: false, reason });
       ctx.ui.notify(`Sandbox refused: ${reason}`, "error");
+      emitPolicyReady(false, reason);
     };
     const startBootstrap = (statusText: string, notice: string) => {
       const pending = verifySandboxBootstrap(filesystem, ctx.cwd).then(
@@ -1720,6 +2553,7 @@ export default function (pi: ExtensionAPI) {
           sandboxEnabled = true;
           sandboxInitialized = true;
           publishActive();
+          emitPolicyReady(true);
           ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", statusText));
           ctx.ui.notify(notice, "info");
         },
@@ -1741,9 +2575,15 @@ export default function (pi: ExtensionAPI) {
         (command, executionId) =>
           wrapForSandbox(
             command,
-            filesystem,
+            {
+              ...filesystem,
+              grants: [...(filesystem.grants ?? []), ...conversationGrants],
+            },
             ctx.cwd,
             executionId ? takeGrantsForExecution(executionId) : [],
+            executionId
+              ? [...exactReads, ...takeExactReadsForExecution(executionId)]
+              : exactReads,
           ),
         grantForExecution,
       );
@@ -1784,14 +2624,15 @@ export default function (pi: ExtensionAPI) {
         active: false,
         reason: `initialization failed: ${err instanceof Error ? err.message : err}`,
       });
-      ctx.ui.notify(
-        `Sandbox initialization failed: ${err instanceof Error ? err.message : err}`,
-        "error",
-      );
+      const reason = `initialization failed: ${err instanceof Error ? err.message : err}`;
+      ctx.ui.notify(`Sandbox ${reason}`, "error");
+      emitPolicyReady(false, reason);
     }
   });
 
   pi.on("session_shutdown", async () => {
+    sessionContext = undefined;
+    (globalThis as PermissionGlobals).__codassPermissionBroker = undefined;
     removePlaceholders(issuedPlaceholders);
     if (sandboxInitialized) {
       try {

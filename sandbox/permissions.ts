@@ -581,9 +581,22 @@ export class PermissionMachine {
     this.conversation = [];
   }
 
+  /** Trusted handoff snapshot, including runtime and remembered allows. */
+  effectiveAllowRules(): AllowRule[] {
+    return [...new Set([
+      ...(this.config.allow ?? []),
+      ...this.conversation,
+      ...this.host.readRules("worktree"),
+      ...this.host.readRules("global"),
+    ])];
+  }
+
   /** The reason the fixed deny list refuses this call, if it does. */
   denyReason(call: ToolCall): string | undefined {
-    if (call.toolName !== "bash" || !call.command) return undefined;
+    if (
+      (call.toolName !== "bash" && call.toolName !== "background_run") ||
+      !call.command
+    ) return undefined;
     const probe = unwrapped(call.command);
     return (this.config.deny ?? []).find((guard) =>
       new RegExp(guard.pattern).test(probe),
@@ -591,12 +604,7 @@ export class PermissionMachine {
   }
 
   allowed(call: ToolCall): boolean {
-    const rules = [
-      ...(this.config.allow ?? []),
-      ...this.conversation,
-      ...this.host.readRules("worktree"),
-      ...this.host.readRules("global"),
-    ];
+    const rules = this.effectiveAllowRules();
     if (call.toolName !== "bash") {
       return rules.some((rule) => matchesRule(rule, call));
     }

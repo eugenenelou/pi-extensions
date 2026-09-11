@@ -143,6 +143,20 @@ test("deny beats allow, and never reaches the judge", async () => {
   assert.equal(f.judged.length, 0);
 });
 
+test("fixed command denies also govern background shell launches", async () => {
+  const f = fakeHost({ verdict: { verdict: "allow" } });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  assert.deepEqual(
+    await machine.decide({
+      toolName: "background_run",
+      command: "git push origin main",
+      input: { command: "git push origin main" },
+    }),
+    { block: true, reason: "permission denied: git push" },
+  );
+  assert.equal(f.judged.length, 0);
+});
+
 test("allow beats the judge, by command prefix and by tool name", async () => {
   const f = fakeHost({ verdict: { verdict: "deny", reason: "no" } });
   const machine = new PermissionMachine(CONFIG, f.host);

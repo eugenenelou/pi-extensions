@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import type { AgentConfig } from "./agents.ts";
+import type { EffectivePolicy } from "../sandbox/authorization.ts";
 import { runSingleAgent } from "./index.ts";
 import { LiveChild } from "./live.ts";
 
@@ -107,6 +108,46 @@ test("child RPC output preserves a multibyte character split across chunks", () 
   live.dispose();
 });
 
+test("a child exit cancels its outstanding forwarded approval", async () => {
+  const stdout = new PassThrough();
+  const stdin = new PassThrough();
+  const proc = Object.assign(new EventEmitter(), {
+    stdout,
+    stdin,
+    stderr: new PassThrough(),
+    killed: false,
+    kill: () => true,
+  }) as unknown as ChildProcess;
+  let requestSignal: AbortSignal | undefined;
+  const live = new LiveChild(
+    proc,
+    "parent-session",
+    process.cwd(),
+    () => {},
+    async (_request, signal) => {
+      requestSignal = signal;
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      return { type: "extension_ui_response", id: "ui-exit", value: "Allow" };
+    },
+  );
+
+  stdout.write(`${JSON.stringify({
+    type: "extension_ui_request",
+    id: "ui-exit",
+    method: "select",
+    title: "Permission",
+    options: ["Allow", "Cancel"],
+  })}\n`);
+  await waitFor(() => requestSignal);
+  proc.emit("close", 0);
+  await waitFor(() => requestSignal?.aborted ? true : undefined);
+  assert.equal(requestSignal?.aborted, true);
+  assert.equal(stdin.readableLength, 0, "a stale approval response was written");
+  live.dispose();
+});
+
 test("a launched child is observed and steered through its one runtime", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-live-child-"));
   const registryDir = path.join(root, "registry");
@@ -120,10 +161,22 @@ test("a launched child is observed and steered through its one runtime", async (
 import { appendFileSync } from "node:fs";
 appendFileSync(process.env.CONTROLLED_STARTS, "started\\n");
 const out = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+process.stderr.write(JSON.stringify({ type: "codass_policy_ready", ready: true }) + "\\n");
 const sessionId = process.env.PI_SUBAGENT_PARENT_SESSION_ID === "child-session" ? "grandchild-session" : "child-session";
 let prompted = false;
+const initialEvents = () => {
+  out({ type: "agent_start" });
+  out({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "initial output" }] } });
+  out({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "controlled", args: {} });
+  out({ type: "tool_execution_end", toolCallId: "tool-1", toolName: "controlled", result: { content: [{ type: "text", text: "tool output" }] }, isError: false });
+};
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const command = JSON.parse(line);
+  if (command.type === "extension_ui_response" && command.id === "ui-1") {
+    appendFileSync(process.env.CONTROLLED_STARTS, "ui:" + String(command.cancelled) + "\\n");
+    initialEvents();
+    return;
+  }
   if (command.type === "get_state") {
     out({ type: "response", id: command.id, command: "get_state", success: true, data: { sessionId } });
     return;
@@ -136,10 +189,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   }
   if (!prompted) {
     prompted = true;
-    out({ type: "agent_start" });
-    out({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "initial output" }] } });
-    out({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "controlled", args: {} });
-    out({ type: "tool_execution_end", toolCallId: "tool-1", toolName: "controlled", result: { content: [{ type: "text", text: "tool output" }] }, isError: false });
+    out({ type: "extension_ui_request", id: "ui-1", method: "select", title: "Permission", options: ["Allow", "Cancel"] });
     return;
   }
   out({ type: "message_end", message: { role: "user", content: command.message } });
@@ -156,6 +206,25 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   process.env.PI_SUBAGENT_REGISTRY_DIR = registryDir;
   process.env.CONTROLLED_STARTS = starts;
 
+  const effectivePolicy: EffectivePolicy = {
+    version: 1,
+    sandbox: { enabled: true, filesystem: {} },
+    filesystem: {},
+    permissions: {},
+    tools: ["read"],
+    grants: [],
+    exactReads: [],
+  };
+  const permission = {
+    effectivePolicy,
+    authorizeDelegation: async () => undefined,
+    validateDelegation: () => true,
+    onUiRequest: async (request: { id: string }) => ({
+      type: "extension_ui_response" as const,
+      id: request.id,
+      cancelled: true,
+    }),
+  };
   const agent: AgentConfig = {
     name: "controlled",
     description: "controlled runtime child",
@@ -176,11 +245,14 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       undefined,
       undefined,
       () => ({ mode: "single", projectAgentsDir: null, results: [] }),
+      permission,
     );
 
     const registryFile = await waitFor(() => {
       try {
-        return fs.readdirSync(registryDir).find((file) => file.endsWith(".json"));
+        return fs
+          .readdirSync(registryDir)
+          .find((file) => file.endsWith(".json"));
       } catch {
         return undefined;
       }
@@ -204,6 +276,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       undefined,
       undefined,
       () => ({ mode: "single", projectAgentsDir: null, results: [] }),
+      permission,
     );
     const grandchildFile = await waitFor(() => {
       try {
@@ -270,7 +343,11 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     });
 
     const grandchildClient = await connect(grandchildRecord.port as number);
-    grandchildClient.send({ type: "message", id: "grandchild-exit", text: "finish" });
+    grandchildClient.send({
+      type: "message",
+      id: "grandchild-exit",
+      text: "finish",
+    });
     for (;;) {
       const update = await grandchildClient.next();
       if (update.type === "closed") break;
@@ -290,18 +367,20 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       undefined,
       undefined,
       () => ({ mode: "single", projectAgentsDir: null, results: [] }),
+      permission,
     );
     client.close();
     grandchildClient.close();
     assert.equal(completed.exitCode, 0);
     assert.equal(exitedDuringStartup.exitCode, 0);
     assert.equal(
-      completed.messages.filter((message) => message.role === "assistant").length,
+      completed.messages.filter((message) => message.role === "assistant")
+        .length,
       2,
     );
     assert.equal(
       fs.readFileSync(starts, "utf-8"),
-      "started\nstarted\nstarted\n",
+      "started\nui:true\nstarted\nui:true\nstarted\n",
     );
     assert.equal(fs.existsSync(path.join(registryDir, registryFile)), false);
     assert.equal(fs.existsSync(path.join(registryDir, grandchildFile)), false);
@@ -309,7 +388,8 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     assert.equal(sawUtf8ClientMessage, true);
   } finally {
     process.argv[1] = originalArgv;
-    if (originalRegistry === undefined) delete process.env.PI_SUBAGENT_REGISTRY_DIR;
+    if (originalRegistry === undefined)
+      delete process.env.PI_SUBAGENT_REGISTRY_DIR;
     else process.env.PI_SUBAGENT_REGISTRY_DIR = originalRegistry;
     if (originalStarts === undefined) delete process.env.CONTROLLED_STARTS;
     else process.env.CONTROLLED_STARTS = originalStarts;
