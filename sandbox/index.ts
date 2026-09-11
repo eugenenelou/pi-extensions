@@ -1385,6 +1385,8 @@ export default function (pi: ExtensionAPI) {
         : Promise.resolve({ verdict: "ask", reason: "no session context" }),
     select: async (message, choices) =>
       deciding?.hasUI ? deciding.ui.select(message, choices) : undefined,
+    editRule: async (message, prefill) =>
+      deciding?.hasUI ? deciding.ui.editor(message, prefill) : undefined,
   };
   const permissions = new PermissionMachine({}, permissionHost);
   let filesystem: FilesystemConfig = {};

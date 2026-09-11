@@ -17,6 +17,7 @@ import {
   type ToolCall,
   type Verdict,
   digestOf,
+  isAllowRule,
   judgeInput,
   noHumanPresent,
   parseVerdict,
@@ -31,6 +32,8 @@ function fakeHost(
     canAsk?: boolean;
     verdict?: Verdict;
     choice?: string;
+    /** The operator at the rule input; by default they confirm the prefill. */
+    edit?: (prefill: string) => string | undefined;
     stores?: Stores;
   } = {},
 ) {
@@ -38,6 +41,8 @@ function fakeHost(
   const judged: ToolCall[] = [];
   const asked: string[][] = [];
   const messages: string[] = [];
+  const prefills: string[] = [];
+  const editMessages: string[] = [];
   const host: PermissionHost = {
     canAsk: () => opts.canAsk ?? true,
     readRules: (scope) => [...stores[scope]],
@@ -53,8 +58,13 @@ function fakeHost(
       asked.push([...choices]);
       return opts.choice;
     },
+    editRule: async (message, prefill) => {
+      prefills.push(prefill);
+      editMessages.push(message);
+      return opts.edit ? opts.edit(prefill) : prefill;
+    },
   };
-  return { host, stores, judged, asked, messages };
+  return { host, stores, judged, asked, messages, prefills, editMessages };
 }
 
 const CONFIG: PermissionConfig = {
@@ -690,4 +700,130 @@ test("an unanswered dialog refuses through the backstop, which never rushes a hu
   assert.match(blocked!.reason, /unanswered/);
   assert.match(blocked!.reason, /proposed rule: bash\(just:\*\)/);
   assert.ok(SELECT_TIMEOUT_MS >= 15 * 60_000);
+});
+
+test("a durable scope stores the rule the operator confirms, not the command", async () => {
+  const f = fakeHost({
+    choice: "Allow globally",
+    verdict: { verdict: "ask", reason: "unclear", proposedRule: "bash(just:*)" },
+    edit: () => "bash(just uv run python:*)",
+  });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  assert.equal(await machine.decide(bash("just uv run python x.py")), undefined);
+  // The proposal is what the operator is handed, with the exact command under
+  // it as the alternative for a call where nothing generic is safe.
+  assert.deepEqual(f.prefills, [
+    "bash(just:*)\nbash(just uv run python x.py)",
+  ]);
+  assert.match(f.editMessages[0], /global/);
+  assert.deepEqual(f.stores.global, ["bash(just uv run python:*)"]);
+  assert.deepEqual(f.stores.worktree, []);
+
+  // The stored shape decides the next call: the allow list, not the judge.
+  const judgedBefore = f.judged.length;
+  assert.equal(await machine.decide(bash("just uv run python other.py")), undefined);
+  assert.equal(f.judged.length, judgedBefore);
+  assert.equal(f.asked.length, 1);
+});
+
+test("the verbatim choice stores the exact subject in the scope chosen", async () => {
+  const f = fakeHost({
+    choice: "Allow for this worktree",
+    verdict: { verdict: "ask", reason: "unclear", proposedRule: "bash(just:*)" },
+    edit: (prefill) => prefill.split("\n")[1],
+  });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  assert.equal(await machine.decide(bash("just test")), undefined);
+  assert.deepEqual(f.stores.worktree, ["bash(just test)"]);
+  assert.deepEqual(f.stores.global, []);
+});
+
+test("with no proposed rule the input is prefilled with the verbatim rule", async () => {
+  const f = fakeHost({ choice: "Allow globally" });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  assert.equal(await machine.decide(bash("just test")), undefined);
+  assert.deepEqual(f.prefills, ["bash(just test)"]);
+  assert.deepEqual(f.stores.global, ["bash(just test)"]);
+});
+
+test("an emptied, dismissed or unanswered input stores nothing and allows once", async () => {
+  for (const edit of [
+    () => "",
+    () => undefined,
+    () => "   \n  ",
+  ] as ((prefill: string) => string | undefined)[]) {
+    const f = fakeHost({ choice: "Allow globally", edit });
+    const machine = new PermissionMachine(CONFIG, f.host);
+    assert.equal(await machine.decide(bash("just test")), undefined);
+    assert.deepEqual(f.stores, { worktree: [], global: [] });
+    assert.equal(await machine.decide(bash("just test")), undefined);
+    assert.equal(f.asked.length, 2);
+  }
+
+  const hanging = fakeHost({ choice: "Allow globally" });
+  hanging.host.editRule = () => new Promise<string | undefined>(() => {});
+  const machine = new PermissionMachine(CONFIG, hanging.host, {
+    selectTimeoutMs: 10,
+  });
+  assert.equal(await machine.decide(bash("just test")), undefined);
+  assert.deepEqual(hanging.stores, { worktree: [], global: [] });
+});
+
+test("a malformed pattern never reaches a rules file, nor a prefill", async () => {
+  for (const text of ["rm -rf ~", "bash()", "bash(foo", "(just:*)", "bash(*)"]) {
+    assert.equal(isAllowRule(text), false, text);
+    const f = fakeHost({ choice: "Allow globally", edit: () => text });
+    assert.equal(
+      await new PermissionMachine(CONFIG, f.host).decide(bash("just test")),
+      undefined,
+    );
+    assert.deepEqual(f.stores, { worktree: [], global: [] }, text);
+  }
+  assert.equal(isAllowRule("bash(just uv run python:*)"), true);
+  // The judge's own proposal is held to the same shape before it is shown.
+  assert.equal(
+    parseVerdict('{"verdict":"ask","proposedRule":"anything goes"}').proposedRule,
+    undefined,
+  );
+});
+
+test("a compound command is never offered as a rule it could not match", async () => {
+  const f = fakeHost({ choice: "Allow globally" });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  // Every sub-command is matched on its own, so the whole line is a dead rule.
+  assert.equal(await machine.decide(bash("cd /tmp && just test")), undefined);
+  assert.deepEqual(f.prefills, []);
+  assert.deepEqual(f.stores, { worktree: [], global: [] });
+
+  const proposed = fakeHost({
+    choice: "Allow globally",
+    verdict: { verdict: "ask", reason: "unclear", proposedRule: "bash(just:*)" },
+  });
+  const next = new PermissionMachine(CONFIG, proposed.host);
+  assert.equal(await next.decide(bash("cd /tmp && just test")), undefined);
+  assert.deepEqual(proposed.prefills, ["bash(just:*)"]);
+});
+
+test("a conversation grant is edited too, and a rule is never stored twice", async () => {
+  const f = fakeHost({
+    choice: "Allow for this conversation",
+    edit: () => "bash(just:*)",
+  });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  assert.equal(await machine.decide(bash("just test")), undefined);
+  assert.equal(await machine.decide(bash("just other")), undefined);
+  assert.equal(f.asked.length, 1);
+
+  const globals = fakeHost({ choice: "Allow globally", edit: () => "bash(just:*)" });
+  const writes: string[][] = [];
+  const write = globals.host.writeRules;
+  globals.host.writeRules = (scope, rules) => {
+    writes.push([...rules]);
+    write(scope, rules);
+  };
+  const second = new PermissionMachine(CONFIG, globals.host);
+  assert.equal(await second.decide(bash("curl a")), undefined);
+  assert.equal(await second.decide(bash("curl b")), undefined);
+  assert.deepEqual(globals.stores.global, ["bash(just:*)"]);
+  assert.equal(writes.length, 1);
 });

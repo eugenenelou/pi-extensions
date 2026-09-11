@@ -49,6 +49,9 @@ export type Verdict = {
 /** Where an allow granted from the dialog is remembered. */
 export type StoredScope = "worktree" | "global";
 
+/** A durable scope, or the session the grant dies with. */
+export type GrantScope = StoredScope | "conversation";
+
 export type Block = { block: true; reason: string };
 
 export interface PermissionHost {
@@ -60,6 +63,11 @@ export interface PermissionHost {
   judge(call: ToolCall, signal: AbortSignal): Promise<Verdict>;
   /** The dialog; the chosen label, or undefined when it was dismissed. */
   select(message: string, choices: string[]): Promise<string | undefined>;
+  /**
+   * The rule input, opened on the prefill; the operator's text, or undefined
+   * when it was dismissed.
+   */
+  editRule(message: string, prefill: string): Promise<string | undefined>;
 }
 
 /** A judge that has not answered within this is treated as unavailable. */
@@ -134,6 +142,12 @@ export const CHOICES = [
   "Allow globally",
   "Refuse",
 ] as const;
+
+const GRANT_SCOPES = new Map<string, GrantScope>([
+  ["Allow for this conversation", "conversation"],
+  ["Allow for this worktree", "worktree"],
+  ["Allow globally", "global"],
+]);
 
 export const JUDGE_SYSTEM_PROMPT = `You decide whether a coding agent may run a tool call.
 
@@ -437,6 +451,39 @@ export function ruleFor(call: ToolCall): AllowRule | undefined {
   return subject ? `${call.toolName}(${subject})` : undefined;
 }
 
+/**
+ * A rule in the `tool(pattern)` form, the only shape written to a rules file.
+ * A bare tool name is refused here although the matcher honours it: it would
+ * grant a whole tool from one call. So is a pattern of nothing but wildcards,
+ * which grants the same thing one character later.
+ */
+const RULE_SHAPE = /^[A-Za-z0-9_.*-]+\(([^\n]+)\)$/;
+
+export function isAllowRule(rule: string): boolean {
+  const pattern = RULE_SHAPE.exec(rule.trim())?.[1];
+  return pattern !== undefined && /[^*:\s]/.test(pattern);
+}
+
+/** The rule the operator left in the input: its first line with text on it. */
+function firstRule(text: string | undefined): AllowRule | undefined {
+  return (text ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .find(Boolean);
+}
+
+/**
+ * The verbatim rule, when it could ever match again. A compound command is
+ * dropped: `allowed()` matches each sub-command on its own, so a rule holding
+ * the whole line — the `cd … && git commit -m "…"` entries the operator files
+ * already carry — is dead the moment it is written.
+ */
+function matchableRuleFor(call: ToolCall): AllowRule | undefined {
+  const rule = ruleFor(call);
+  if (!rule || call.toolName !== "bash") return rule;
+  return splitCommand(call.command ?? "")?.length === 1 ? rule : undefined;
+}
+
 /** A wrapper prefix must not hide what actually runs. */
 function unwrapped(command: string): string {
   return command.replace(/^\s*rtk\s+/, "");
@@ -458,8 +505,10 @@ export function parseVerdict(text: string): Verdict {
     unknown
   >;
   const known = verdict === "allow" || verdict === "deny" || verdict === "ask";
+  // Its destinations are a refusal the agent reads and an input whose result is
+  // written as a rule, so a proposal that is not rule-shaped is no proposal.
   const rule =
-    typeof proposedRule === "string" && proposedRule.trim()
+    typeof proposedRule === "string" && isAllowRule(proposedRule)
       ? proposedRule.trim()
       : undefined;
   return {
@@ -612,29 +661,48 @@ export class PermissionMachine {
     }
     const choice = answer.value;
     if (choice === "Allow once") return undefined;
-    if (
-      choice === "Allow for this conversation" ||
-      choice === "Allow for this worktree" ||
-      choice === "Allow globally"
-    ) {
-      const rule = ruleFor(call);
-      // Nothing specific enough to remember: the grant degrades to allow once.
-      if (!rule) return undefined;
-      if (choice === "Allow for this conversation") {
-        this.conversation.push(rule);
-        return undefined;
-      }
-      const scope: StoredScope =
-        choice === "Allow globally" ? "global" : "worktree";
-      const stored = this.host.readRules(scope);
-      if (!stored.includes(rule)) {
-        this.host.writeRules(scope, [...stored, rule]);
-      }
-      return undefined;
-    }
+    const scope = GRANT_SCOPES.get(choice ?? "");
+    if (scope) return this.remember(call, scope, proposedRule);
     return {
       block: true,
       reason: withProposedRule(`permission refused: ${why}`, proposedRule),
     };
+  }
+
+  /**
+   * The rule the operator authors, in the scope they named. They are handed the
+   * judge's proposal to tighten, with the exact subject under it for a call
+   * where nothing generic is safe; nothing reaches a file the operator has not
+   * accepted. Storing nothing leaves the call allowed once, never a dead end.
+   */
+  private async remember(
+    call: ToolCall,
+    scope: GrantScope,
+    proposedRule: AllowRule | undefined,
+  ): Promise<undefined> {
+    const verbatim = matchableRuleFor(call);
+    const prefill = [...new Set([proposedRule, verbatim].filter(Boolean))].join(
+      "\n",
+    );
+    // Nothing specific enough to remember: the grant degrades to allow once.
+    if (!prefill) return undefined;
+    const answer = await answerWithin(
+      this.host.editRule(
+        `rule to store (${scope}); the first line is kept, an empty input stores nothing`,
+        prefill,
+      ),
+      this.selectTimeoutMs,
+    );
+    const rule = answer.answered ? firstRule(answer.value) : undefined;
+    if (!rule || !isAllowRule(rule)) return undefined;
+    if (scope === "conversation") {
+      if (!this.conversation.includes(rule)) this.conversation.push(rule);
+      return undefined;
+    }
+    const stored = this.host.readRules(scope);
+    if (!stored.includes(rule)) {
+      this.host.writeRules(scope, [...stored, rule]);
+    }
+    return undefined;
   }
 }
