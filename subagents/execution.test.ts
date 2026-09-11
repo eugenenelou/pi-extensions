@@ -3,6 +3,9 @@ import test from "node:test";
 import type { AgentConfig } from "./agents.ts";
 import {
   executeSingleAgent,
+  getFinalOutput,
+  getResultOutput,
+  isFailedResult,
   type ExecutionChild,
   type ProcessHost,
 } from "./execution.ts";
@@ -183,8 +186,48 @@ test("aborting execution terminates the child and cleans up temporary resources"
   assert.equal(host.child.terminated, true);
   host.child.exit(143);
 
-  await assert.rejects(running, /Subagent was aborted/);
+  const result = await running;
+  assert.equal(result.stopReason, "aborted");
   assert.deepEqual(host.removed, ["/tmp/prompt-worker.md", "/tmp/mcp-worker.json"]);
+});
+
+test("an aborted run returns the work accumulated before the abort", async () => {
+  const host = new FakeHost();
+  const controller = new AbortController();
+  const running = request(host, controller.signal);
+
+  await new Promise((resolve) => setImmediate(resolve));
+  host.child.emit({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      model: "provider/child",
+      stopReason: "end",
+      usage: {
+        input: 30,
+        output: 12,
+        cacheRead: 3,
+        cacheWrite: 1,
+        totalTokens: 46,
+        cost: { total: 0.5 },
+      },
+      content: [{ type: "text", text: "partial progress" }],
+    },
+  });
+  controller.abort();
+  host.child.exit(143);
+
+  const result = await running;
+  assert.equal(result.stopReason, "aborted");
+  assert.equal(isFailedResult(result), true);
+  assert.equal(result.exitCode, 143);
+  assert.equal(result.messages.length, 1);
+  assert.equal(getFinalOutput(result.messages), "partial progress");
+  assert.equal(result.usage.turns, 1);
+  assert.equal(result.usage.input, 30);
+  assert.equal(result.usage.output, 12);
+  assert.equal(result.usage.cost, 0.5);
+  assert.equal(getResultOutput(result), "partial progress");
 });
 
 test("unknown agents return an equivalent error result without starting a child", async () => {

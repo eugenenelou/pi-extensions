@@ -270,7 +270,7 @@ export async function executeSingleAgent({
       throw error;
     }
     currentResult.exitCode = await child.waitForExit();
-    if (wasAborted) throw new Error("Subagent was aborted");
+    if (wasAborted) currentResult.stopReason = "aborted";
     return currentResult;
   } finally {
     if (tmpPrompt) host.removeTemp(tmpPrompt);
