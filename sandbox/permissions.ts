@@ -137,11 +137,41 @@ function subagentsOf(input: unknown): string | undefined {
   return agents.length ? [...new Set(agents)].sort().join(", ") : undefined;
 }
 
+/**
+ * What an `mcp` call reaches. The adapter routes every server through this one
+ * tool, so its arguments — a different url or element ref every time — identify
+ * nothing; the tool being called, or the gateway mode, is what a rule can name.
+ * The order mirrors the adapter's own dispatch.
+ */
+function mcpTargetOf(input: unknown): string {
+  const params = (input ?? {}) as Record<string, unknown>;
+  const text = (key: string): string | undefined =>
+    typeof params[key] === "string" ? (params[key] as string) : undefined;
+  const action = text("action");
+  if (action === "auth-start") return "auth/start";
+  if (action === "auth-complete") return "auth/complete";
+  if (action) return `gateway/${action}`;
+  const tool = text("tool");
+  // A tool named without its server keeps the name the model wrote; the two
+  // spellings are separate subjects, and a server-wide rule covers both.
+  if (tool) {
+    const server = text("server");
+    return server ? `${server}/${tool}` : tool;
+  }
+  if (text("connect")) return "gateway/connect";
+  if (text("describe")) return "gateway/describe";
+  if (text("instructions")) return "gateway/instructions";
+  if (params.search !== undefined) return "gateway/search";
+  if (text("server")) return "gateway/list";
+  return "gateway/status";
+}
+
 /** The text a rule is matched against: the command, the path, or the arguments. */
 export function subjectOf(call: ToolCall): string {
   if (call.toolName === "bash") return call.command ?? "";
   if (typeof call.path === "string") return call.path;
   if (call.toolName === "subagent") return subagentsOf(call.input) ?? "";
+  if (call.toolName === "mcp") return mcpTargetOf(call.input);
   return call.input === undefined ? "" : renderArguments(call.input);
 }
 

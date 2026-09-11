@@ -339,3 +339,112 @@ test("a subagent call is identified by its agents, so a grant covers any task", 
   assert.equal(await machine.decide(single), undefined);
   assert.equal(f.asked.length, 2);
 });
+
+const gateway = (input: Record<string, unknown>): ToolCall => ({
+  toolName: "mcp",
+  input,
+});
+
+test("gateway housekeeping is identified by its mode, never by its arguments", () => {
+  assert.equal(
+    subjectOf(gateway({ connect: "playwright" })),
+    "gateway/connect",
+  );
+  assert.equal(
+    subjectOf(gateway({ search: "browser", server: "playwright", limit: 12 })),
+    "gateway/search",
+  );
+  assert.equal(
+    subjectOf(gateway({ describe: "playwright_browser_navigate" })),
+    "gateway/describe",
+  );
+  assert.equal(
+    subjectOf(gateway({ instructions: "playwright" })),
+    "gateway/instructions",
+  );
+  assert.equal(subjectOf(gateway({ server: "playwright" })), "gateway/list");
+  assert.equal(subjectOf(gateway({})), "gateway/status");
+  assert.equal(
+    subjectOf(gateway({ action: "ui-messages" })),
+    "gateway/ui-messages",
+  );
+});
+
+test("an auth action is not housekeeping, so `gateway/*` never grants it", async () => {
+  assert.equal(
+    subjectOf(gateway({ action: "auth-start", server: "notion" })),
+    "auth/start",
+  );
+  assert.equal(
+    subjectOf(gateway({ action: "auth-complete", server: "notion", args: {} })),
+    "auth/complete",
+  );
+
+  const f = fakeHost({ hasUI: false });
+  const machine = new PermissionMachine({ allow: ["mcp(gateway/*)"] }, f.host);
+  assert.equal(
+    await machine.decide(gateway({ connect: "playwright" })),
+    undefined,
+  );
+  assert.equal(f.judged.length, 0);
+  assert.equal(
+    (await machine.decide(gateway({ action: "auth-start", server: "notion" })))
+      ?.block,
+    true,
+  );
+});
+
+test("an mcp tool call is identified by its tool, so a grant covers any arguments", async () => {
+  const navigate = gateway({
+    tool: "playwright_browser_navigate",
+    args: { url: "http://piston.localhost:8006/ask" },
+  });
+  assert.equal(subjectOf(navigate), "playwright_browser_navigate");
+  assert.equal(
+    subjectOf(
+      gateway({ server: "playwright", tool: "browser_click", args: {} }),
+    ),
+    "playwright/browser_click",
+  );
+  assert.match(
+    digestOf(navigate),
+    /"url": "http:\/\/piston.localhost:8006\/ask"/,
+  );
+
+  const f = fakeHost({ choice: "Allow for this worktree" });
+  const machine = new PermissionMachine(CONFIG, f.host);
+  assert.equal(await machine.decide(navigate), undefined);
+  assert.deepEqual(f.stores.worktree, ["mcp(playwright_browser_navigate)"]);
+
+  const elsewhere = gateway({
+    tool: "playwright_browser_navigate",
+    args: { url: "http://piston.localhost:8006/orders" },
+  });
+  assert.equal(await machine.decide(elsewhere), undefined);
+  assert.equal(f.asked.length, 1);
+});
+
+test("a whole server is grantable, whichever way its tools are named", async () => {
+  const f = fakeHost({ hasUI: false });
+  const machine = new PermissionMachine(
+    { allow: ["mcp(playwright/*)", "mcp(playwright_*)"] },
+    f.host,
+  );
+  assert.equal(
+    await machine.decide(
+      gateway({ tool: "playwright_browser_click", args: { ref: "e12" } }),
+    ),
+    undefined,
+  );
+  assert.equal(
+    await machine.decide(
+      gateway({ server: "playwright", tool: "browser_type", args: {} }),
+    ),
+    undefined,
+  );
+  assert.equal(f.judged.length, 0);
+  assert.equal(
+    (await machine.decide(gateway({ tool: "notion_create", args: {} })))?.block,
+    true,
+  );
+});
